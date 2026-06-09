@@ -1,0 +1,135 @@
+# ── Environment & secrets ─────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets/
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+dmypy.json
+
+# ── Node / frontend (dashboard) ───────────────────────────────
+node_modules/
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.vite/
+*.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── ML / vision artifacts ─────────────────────────────────────
+# Downloaded or trained models (large; mount in prod, don't commit)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.weights
+runs/
+wandb/
+mlruns/
+
+# Ultralytics / PaddleOCR caches
+Ultralytics/
+.paddlex/
+.paddleocr/
+
+# ── Docker ────────────────────────────────────────────────────
+# Local override files (keep docker-compose.yml tracked)
+docker-compose.override.yml
+docker-compose.*.local.yml
+
+# ── IDE / editors ─────────────────────────────────────────────
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Cursor (keep rules/skills if you add them later via ! patterns)
+.cursor/
+
+# ── OS ────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ── Logs & runtime ────────────────────────────────────────────
+*.log
+logs/
+tmp/
+temp/
+*.pid
+*.seed
+*.pid.lock
+
+# ── Archives & media (dev captures) ───────────────────────────
+*.mp4
+*.avi
+*.mkv
+*.mov
+!docs/**/*.mp4
+
+# ── Database dumps (local dev only) ───────────────────────────
+*.sql.gz
+*.dump
+backups/
+
+# ── Jupyter ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints

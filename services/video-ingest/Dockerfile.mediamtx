@@ -1,0 +1,4 @@
+FROM busybox:1.37-musl AS tools
+
+FROM bluenviron/mediamtx:latest
+COPY --from=tools /bin/wget /bin/wget

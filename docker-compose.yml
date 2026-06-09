@@ -1,0 +1,253 @@
+# ─────────────────────────────────────────────
+# Police AI – Local Development Stack
+# Run: docker compose up -d
+# No GPU required for local dev (mock AI workers)
+# ─────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL (primary data store + audit log) ──
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: pai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: policeai
+      POSTGRES_USER: policeai
+      POSTGRES_PASSWORD: policeai_dev_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U policeai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis Streams (alert queue + pub/sub) ──
+  redis:
+    image: redis:7-alpine
+    container_name: pai_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MediaMTX (RTSP ingestion + WebRTC/WHEP) ──
+  mediamtx:
+    build:
+      context: ./services/video-ingest
+      dockerfile: Dockerfile.mediamtx
+    container_name: pai_mediamtx
+    restart: unless-stopped
+    ports:
+      - "8554:8554"       # RTSP
+      - "8889:8889"       # WebRTC/WHEP signaling (HTTP)
+      - "8189:8189/udp"   # WebRTC ICE (media) — required or browser ICE fails
+      - "8189:8189/tcp"   # WebRTC ICE fallback (restrictive networks)
+      - "8888:8888"       # HLS
+      - "9997:9997"       # API
+    volumes:
+      - ./services/video-ingest/mediamtx.yml:/mediamtx.yml
+    healthcheck:
+      test: ["CMD", "/bin/wget", "-qO-", "http://127.0.0.1:9997/v3/paths/list"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Fake RTSP camera (for local dev — loops a test video) ──
+  fake-camera:
+    image: linuxserver/ffmpeg:latest
+    container_name: pai_fake_camera
+    restart: unless-stopped
+    depends_on:
+      mediamtx:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - >
+        ffmpeg -re -stream_loop -1
+        -f lavfi -i testsrc2=size=1280x720:rate=25
+        -c:v libx264 -preset ultrafast -tune zerolatency
+        -b:v 1M -maxrate 1M -bufsize 2M
+        -an -f rtsp rtsp://mediamtx:8554/cam01
+
+  # ── Video ingest service (camera registry + health) ──
+  video-ingest:
+    build:
+      context: ./services/video-ingest
+      dockerfile: Dockerfile
+      network: host
+    container_name: pai_video_ingest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      MEDIAMTX_URL: http://mediamtx:9997
+      RTSP_BASE_URL: rtsp://mediamtx:8554
+      WHEP_BASE_URL: http://localhost:8889
+      HLS_BASE_URL: http://localhost:8888
+      PUBLIC_RTSP_URL: rtsp://localhost:8554
+    ports:
+      - "8001:8001"
+
+  # ── Traffic AI worker (YOLO — mock in local dev) ──
+  traffic-ai:
+    build:
+      context: ./services/traffic-ai
+      dockerfile: Dockerfile
+      network: host
+    container_name: pai_traffic_ai
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      video-ingest:
+        condition: service_started
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      RTSP_BASE_URL: rtsp://mediamtx:8554
+      VIDEO_INGEST_URL: http://video-ingest:8001
+      # FRAME_SOURCE: rtsp = live MediaMTX streams (real detection on all cameras)
+      #               mock = synthetic alerts | queue = ingest_pipeline multiprocessing.Queue
+      FRAME_SOURCE: "rtsp"
+      USE_GPU: "false"            # CPU dev box; set "true" on Node A (A100 + CUDA 12)
+      CAMERA_IDS: "cam01"         # fallback only — cameras auto-discovered from DB + video-ingest
+      TRAFFIC_CONF_THRESHOLD: "0.35"
+      CAMERA_FPS: "10"
+      LOG_LEVEL: "INFO"
+      INJECT_TEST_VIOLATIONS: "false"
+      ANPR_ENABLED: "false"       # plate OCR (PaddleOCR) — heavy; enable on GPU node (Node A)
+    ports:
+      - "8002:8002"
+
+  # ── Face recognition worker (InsightFace — mock in local dev) ──
+  face-ai:
+    build:
+      context: ./services/face-ai
+      dockerfile: Dockerfile
+      network: host
+    container_name: pai_face_ai
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      RTSP_BASE_URL: rtsp://mediamtx:8554
+      MOCK_MODE: "true"
+      FACE_MATCH_THRESHOLD: "0.75"
+    ports:
+      - "8003:8003"
+
+  # ── Alert service (Redis → PostgreSQL → WebSocket) ──
+  alert-service:
+    build:
+      context: ./services/alert-service
+      dockerfile: Dockerfile
+      network: host
+    container_name: pai_alert_service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: dev_jwt_secret_change_in_prod
+      DEDUP_WINDOW_SECONDS: "30"
+    ports:
+      - "8004:8004"
+
+  # ── GD/FIR drafting service ──
+  drafting:
+    build:
+      context: ./services/drafting
+      dockerfile: Dockerfile
+      network: host
+    container_name: pai_drafting
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      LLM_API_URL: http://host.docker.internal:11434
+      LLM_MODEL: llama3.1:8b
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8006:8006"
+
+  # ── Keycloak (RBAC auth) ──
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: pai_keycloak
+    restart: unless-stopped
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: dev-mem
+    command: start-dev
+    ports:
+      - "8080:8080"
+
+  # ── React dashboard (frontend dev server) ──
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile.dev
+      network: host
+    container_name: pai_dashboard
+    restart: unless-stopped
+    depends_on:
+      - alert-service
+    environment:
+      VITE_ALERT_SERVICE_URL: http://localhost:8004
+      VITE_VIDEO_INGEST_URL: http://localhost:8001
+      VITE_MEDIAMTX_WHEP_URL: http://localhost:8889
+      VITE_MEDIAMTX_HLS_URL: http://localhost:8888
+      VITE_TRAFFIC_AI_URL: http://localhost:8002
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./dashboard/src:/app/src   # hot reload
+
+  # ── Nginx reverse proxy ──
+  nginx:
+    image: nginx:alpine
+    container_name: pai_nginx
+    restart: unless-stopped
+    depends_on:
+      - alert-service
+      - drafting
+      - dashboard
+      - mediamtx
+    ports:
+      - "80:80"
+    volumes:
+      - ./infra/nginx.conf:/etc/nginx/conf.d/default.conf
+
+volumes:
+  postgres_data:
+  redis_data:

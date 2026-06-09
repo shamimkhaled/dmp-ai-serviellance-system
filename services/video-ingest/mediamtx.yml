@@ -1,0 +1,116 @@
+################################################################################
+# MediaMTX — Police AI · Local Development Stack
+# ═══════════════════════════════════════════════
+# Production config: infra/mediamtx/mediamtx.yml
+# This file is used by docker-compose for local dev (no VLAN, no NFS).
+#
+# Key differences from production:
+#   rtspAddress: :8554     (all interfaces — no VLAN isolation in Docker)
+#   apiAddress:  :9997     (exposed so host health-checks work)
+#   record: false          (no NFS archive in local dev)
+#   authMethod: internal   (allow any — no credential enforcement)
+################################################################################
+
+###############################################################################
+# 1. Global
+###############################################################################
+logLevel: info
+logDestinations: [stdout]
+readTimeout:     10s
+writeTimeout:    10s
+readBufferCount: 512
+
+###############################################################################
+# 2. RTSP server
+###############################################################################
+rtsp:          true
+rtspAddress:   :8554
+protocols:     [tcp]
+encryption:    "no"
+rtspAuthMethods: [basic]
+
+###############################################################################
+# 3. WebRTC / WHEP
+###############################################################################
+webrtc:              true
+webrtcAddress:       :8889
+webrtcICEServers2:   []
+# Docker fix: the browser runs on the host, but MediaMTX otherwise only
+# advertises its internal container IP (unreachable) → "ICE failed".
+# Advertise a host-reachable candidate and pin the ICE port so it can be
+# published by docker-compose (UDP primary, TCP fallback for strict networks).
+webrtcAdditionalHosts:  [127.0.0.1]
+webrtcLocalUDPAddress:  :8189
+webrtcLocalTCPAddress:  :8189
+
+###############################################################################
+# 4. HLS (Safari / fallback)
+###############################################################################
+hls:                 true
+hlsAddress:          :8888
+hlsSegmentCount:     7
+hlsSegmentDuration:  1s
+
+###############################################################################
+# 5. API
+###############################################################################
+api:        true
+# Exposed on all interfaces in Docker so health-check probes reach it.
+# In production this is 127.0.0.1:9997 only (infra/mediamtx/mediamtx.yml).
+apiAddress: :9997
+
+###############################################################################
+# 6. Auth (dev: open — any client may publish or read)
+###############################################################################
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+      - action: metrics
+      - action: pprof
+
+###############################################################################
+# 7. Path defaults
+###############################################################################
+pathDefaults:
+  source: publisher
+  record: false   # no archiving in local dev
+
+###############################################################################
+# 8. Paths
+###############################################################################
+paths:
+
+  # Fake camera (ffmpeg test source) pushes here.
+  cam01:
+    source:         publisher
+    sourceOnDemand: false
+
+  cam02:
+    source:         publisher
+    sourceOnDemand: false
+
+  cam03:
+    source:         publisher
+    sourceOnDemand: false
+
+  cam04:
+    source:         publisher
+    sourceOnDemand: false
+
+  # Catch-all for cameras registered dynamically by the ingest service.
+  "~^cam[0-9]+$":
+    source:         publisher
+    sourceOnDemand: false
+
+  # H.264 relay paths for H.265 cameras (created by transcode_manager.py).
+  "~^cam[0-9]+_view$":
+    source:         publisher
+    sourceOnDemand: false
+    record:         false

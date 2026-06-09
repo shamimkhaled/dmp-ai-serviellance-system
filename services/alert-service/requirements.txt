@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn[standard]
+asyncpg
+redis[asyncio]
+pydantic>=2

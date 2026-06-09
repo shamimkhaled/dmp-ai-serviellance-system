@@ -1,0 +1,222 @@
+################################################################################
+# MediaMTX — Police AI Surveillance · Node B (production)
+# ════════════════════════════════════════════════════════
+# Hardware:  Ubuntu 22.04 · 64 GB RAM · 10GbE NIC (camera VLAN)
+#                                      · 100GbE QSFP-DD (Node A AI link)
+# Data flows:
+#   Cameras  → RTSP/TCP push → this node (VLAN 100, port 8554)
+#   Node A   ← RTSP re-stream pulled over 100GbE inter-node link
+#   Operators ← WebRTC/WHEP browser playback (port 8889)
+#   Archiver ← fmp4 segments written to Node C NFS at /mnt/storage/archive/
+#   Loki     ← JSON log lines scraped from stdout by Promtail
+#
+# Reference: https://github.com/bluenviron/mediamtx
+################################################################################
+
+
+###############################################################################
+# 1. Global settings
+###############################################################################
+
+# Structured JSON to stdout only — Promtail/Loki scrapes this.
+logLevel: info
+logDestinations: [stdout]
+
+# Drop stuck/slow clients quickly — CCTV must stay real-time.
+# 10 s read/write timeout suits 4MP H.264 at typical LAN latencies.
+readTimeout:  10s
+writeTimeout: 10s
+
+# Per-reader packet buffer. 512 covers many concurrent 4MP H.264/H.265
+# consumers (dashboard + Node A AI workers) without excessive RAM use.
+readBufferCount: 512
+
+
+###############################################################################
+# 2. RTSP server   (camera ingest — VLAN 100 only)
+###############################################################################
+
+rtsp: yes
+
+# Bind ONLY to this node's VLAN 100 interface so cameras (and the
+# Node A puller) can reach it, while the management network cannot.
+# Replace 10.100.0.10 with the actual IP of the camera-network NIC.
+# The variable $RTSP_BIND_ADDR can override this at container start:
+#   MEDIAMTX_RTSPADDRESS=10.100.0.10:8554
+rtspAddress: 10.100.0.10:8554
+
+# TCP-only transport: no UDP packet-loss artifacts, survives strict
+# firewalls and NAT, mandatory for reliable CCTV ingest.
+protocols: [tcp]
+
+# Plaintext within the controlled VLAN; TLS would add latency and
+# complexity for traffic that never leaves the physical datacenter.
+encryption: "no"
+
+# RTSP authentication method.  Camera network is VLAN-isolated, so
+# we use basic auth as a secondary control (primary = network policy).
+rtspAuthMethods: [basic]
+
+
+###############################################################################
+# 3. WebRTC / WHEP server   (operator dashboard — browser-native playback)
+###############################################################################
+
+webrtc: yes
+
+# Bind on all interfaces so dashboard nginx can reach it.
+# The operator-facing NIC forwards port 8889 to the browser.
+webrtcAddress: :8889
+
+# LAN-only deployment: no STUN/TURN needed — all parties are on the
+# same datacenter L2/L3 segment.  An empty list disables ICE servers.
+webrtcICEServers2: []
+
+
+###############################################################################
+# 4. HLS server   (Safari / fallback browser playback)
+###############################################################################
+
+hls: yes
+
+# Same bind-all — accessed via nginx proxy from the dashboard.
+hlsAddress: :8888
+
+# 7 × 1 s segments = 7 s rolling buffer.  Low enough for near-real-time
+# monitoring; large enough to survive brief I/O spikes.
+hlsSegmentCount:    7
+hlsSegmentDuration: 1s
+
+
+###############################################################################
+# 5. API server   (management, health checks — localhost only)
+###############################################################################
+
+api: yes
+
+# Bound to loopback.  Only the on-node video-ingest service and local
+# health probes can reach it.  Never expose port 9997 externally.
+apiAddress: 127.0.0.1:9997
+
+
+###############################################################################
+# 6. Authentication (internal users)
+###############################################################################
+
+# Cameras and AI workers authenticate by network policy (VLAN + ACL).
+# A single "any" user is granted all actions — access control is
+# enforced at the network layer, not per-stream credentials.
+# Harden this to named users + passwords when deploying to a shared
+# network segment.
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+      - action: metrics
+
+
+###############################################################################
+# 7. Recording defaults (YAML anchor — merged into every camera path)
+###############################################################################
+
+# The anchor &recording is applied with <<: *recording in every camera
+# path below, so retention/format settings live in a single place.
+#
+# ${camID}  expands to the matched path name at runtime (e.g. "cam07").
+# Segments: 30 min (1 800 s) → manageable file sizes for archival.
+# Retention: 30 days (2 592 000 s) — adjust to local policy.
+#            Set recordDeleteAfter: 0s to disable automatic deletion.
+
+recordingDefaults: &recording
+  record:                 yes
+  recordPath:             /mnt/storage/archive/${camID}/%Y/%m/%d/%H-%M-%S.mp4
+  recordFormat:           fmp4
+  recordSegmentDuration:  1800s    # 30-minute segments
+  recordDeleteAfter:      2592000s # 30-day retention
+
+
+###############################################################################
+# 8. Path defaults (apply to paths not matched by a specific rule below)
+###############################################################################
+
+pathDefaults:
+  source: publisher   # cameras push unless overridden per-path
+  record: false       # recording OFF unless the path explicitly enables it
+
+
+###############################################################################
+# 9. Camera paths
+###############################################################################
+#
+# Regex rule — matches cam01 … cam99 (and cam001 etc.)
+#   source: publisher  — cameras push RTSP to rtsp://node:8554/<camID>
+#   readUser / publishUser empty — access governed by network policy
+#   <<: *recording     — 30-min fmp4 segments, 30-day retention
+#
+# Named paths (cam01–cam04) are explicitly declared so their path-level
+# sourceOnDemand flag is false; MediaMTX does not tear down the path
+# between camera reconnects, preserving recording continuity.
+# Paths beyond cam04 are handled by the regex fallback automatically.
+#
+# Node A AI workers pull the re-stream via:
+#   rtsp://10.100.0.10:8554/<camID>   (RTSP/TCP over 100GbE link)
+# Operator dashboard consumes WebRTC via:
+#   http://<node>:8889/<camID>/whep
+
+paths:
+
+  # ── Explicit paths (cam01–cam04 always present; adjust as deployed) ──────
+  cam01:
+    source:            publisher
+    sourceOnDemand:    false   # keep path alive between camera reconnects
+    readUser:          ""
+    publishUser:       ""
+    <<: *recording
+
+  cam02:
+    source:            publisher
+    sourceOnDemand:    false
+    readUser:          ""
+    publishUser:       ""
+    <<: *recording
+
+  cam03:
+    source:            publisher
+    sourceOnDemand:    false
+    readUser:          ""
+    publishUser:       ""
+    <<: *recording
+
+  cam04:
+    source:            publisher
+    sourceOnDemand:    false
+    readUser:          ""
+    publishUser:       ""
+    <<: *recording
+
+  # ── Dynamic cameras registered by the video-ingest service ───────────────
+  # Regex pattern — catches cam05 through cam32 (and beyond).
+  # The video-ingest FastAPI service registers each camera path via the
+  # MediaMTX /v3/config/paths/add/<camID> REST API; this fallback rule
+  # provides recording config for any camera not listed above.
+  "~^cam[0-9]+$":
+    source:         publisher
+    sourceOnDemand: false
+    readUser:       ""
+    publishUser:    ""
+    <<: *recording
+
+  # ── H.264 relay paths (auto-created by transcode_manager.py) ─────────────
+  # For H.265 cameras, the ingest service spawns an FFmpeg relay that
+  # re-encodes to H.264 and publishes to <camID>_view.  These paths do
+  # NOT need recording (the original H.265 stream is already archived).
+  "~^cam[0-9]+_view$":
+    source:         publisher
+    sourceOnDemand: false
+    record:         false
