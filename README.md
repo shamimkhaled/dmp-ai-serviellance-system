@@ -1,7 +1,6 @@
-# Police AI — Developer Documentation
+# DMP AI Serveillance System —  Documentation
 
-Bangladesh Police · Sovereign AI Operating Layer  
-Built by Unicorns Codes
+Bangladesh DMP · Sovereign AI Operating Layer  
 
 On-premise surveillance and AI-assisted command platform: camera ingestion, realtime object detection, alert pipeline, operator dashboard (Bangla/English), GD/FIR drafting, and immutable audit logging.
 
@@ -107,8 +106,8 @@ flowchart LR
 ### 1. Clone and enter the project
 
 ```bash
-git clone <repo-url> police-ai-starter
-cd police-ai-starter
+git clone <repo-url> dmp-ai-serviellance-system
+cd dmp-ai-serviellance-system
 ```
 
 ### 2. Start the full stack
@@ -174,7 +173,7 @@ docker compose down -v       # delete volumes (fresh DB)
 ## Project structure
 
 ```
-police-ai-starter/
+dmp-ai-serviellance-system/
 ├── docker-compose.yml          # Local dev stack (all services)
 ├── db/
 │   ├── schema.sql              # PostgreSQL schema (auto-applied on first postgres start)
