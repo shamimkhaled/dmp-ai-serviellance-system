@@ -67,6 +67,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         except Exception:
             pass  # Group already exists
 
+    # Idempotent migration: add snapshot_b64 column if it doesn't exist yet
+    await pool.execute(
+        "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS snapshot_b64 TEXT"
+    )
     log.info("Alert service ready")
     consumer_task = asyncio.create_task(consume_alerts())
     yield
@@ -178,27 +182,30 @@ async def process_alert(stream: str, msg_id: str, data: dict):
     frame_ts     = datetime.fromisoformat(frame_ts_str)
 
     # ── 1. Dedup check ────────────────────────
-    dedup_key = f"dedup:{alert_type}:{camera_id}"
+    # Key includes track_id so different vehicles of the same type are not
+    # merged into one alert.  Falls back to alert_id when track_id is absent
+    # (e.g. face-ai / crowd alerts that don't carry a track_id).
+    track_id = metadata.get("track_id", data.get("alert_id", ""))
+    dedup_key = f"dedup:{alert_type}:{camera_id}:{track_id}"
     if await redis_client.get(dedup_key):
         log.debug(f"Dedup suppressed: {dedup_key}")
         return
     await redis_client.setex(dedup_key, DEDUP_WINDOW, "1")
 
-    # ── 2. Save alert snapshot to storage path ─
+    # ── 2. Save alert snapshot ────────────────
     snapshot_path = None
     if snapshot_b64:
         snapshot_path = f"snapshots/{camera_id}/{datetime.now().strftime('%Y/%m/%d')}/{msg_id}.jpg"
-        # In production: write to MinIO / Node C path
-        # For now: just record the path
+        # In production: write bytes to MinIO / Node C at snapshot_path
 
     # ── 3. Insert alert into PostgreSQL ──────
     alert_id = await pool.fetchval(
         """INSERT INTO alerts
-           (alert_type, camera_id, confidence, severity, snapshot_path,
+           (alert_type, camera_id, confidence, severity, snapshot_path, snapshot_b64,
             object_metadata, location_name, latitude, longitude, raw_frame_ts)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
            RETURNING id""",
-        alert_type, camera_id, confidence, severity, snapshot_path,
+        alert_type, camera_id, confidence, severity, snapshot_path, snapshot_b64 or None,
         json.dumps(metadata), location, lat or None, lng or None, frame_ts
     )
 
@@ -359,6 +366,187 @@ class ForensicQuery(BaseModel):
 async def forensic_search(body: ForensicQuery):
     """Stub — returns empty until forensic index is wired."""
     return {"results": [], "query": body.query, "note": "Forensic search not yet indexed"}
+
+
+# ── Analytics endpoints ───────────────────────────────────────────────────────
+
+@app.get("/analytics/summary")
+async def analytics_summary():
+    """
+    Today's alert summary:
+    - total alerts today
+    - breakdown by alert_type
+    - breakdown by severity
+    - top cameras by alert volume (last 24 h)
+    - pending count
+    """
+    type_rows = await pool.fetch("""
+        SELECT alert_type, COUNT(*) AS count
+        FROM   alerts
+        WHERE  created_at >= CURRENT_DATE
+        GROUP BY alert_type
+        ORDER BY count DESC
+    """)
+    sev_rows = await pool.fetch("""
+        SELECT severity, COUNT(*) AS count
+        FROM   alerts
+        WHERE  created_at >= CURRENT_DATE
+        GROUP BY severity
+        ORDER BY severity DESC
+    """)
+    cam_rows = await pool.fetch("""
+        SELECT camera_id,
+               COUNT(*) AS total,
+               SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending
+        FROM   alerts
+        WHERE  created_at >= NOW() - INTERVAL '24 hours'
+        GROUP BY camera_id
+        ORDER BY total DESC
+        LIMIT 10
+    """)
+    pending_count = await pool.fetchval(
+        "SELECT COUNT(*) FROM alerts WHERE status = 'pending'"
+    )
+    total_today = sum(r["count"] for r in type_rows)
+    return {
+        "total_today":   total_today,
+        "pending":       pending_count or 0,
+        "by_type":       [{"type": r["alert_type"], "count": r["count"]} for r in type_rows],
+        "by_severity":   [{"severity": r["severity"], "count": r["count"]} for r in sev_rows],
+        "by_camera":     [
+            {"camera_id": r["camera_id"], "total": r["total"], "pending": r["pending"] or 0}
+            for r in cam_rows
+        ],
+    }
+
+
+@app.get("/analytics/violations")
+async def analytics_violations(hours: int = 24, camera_id: str | None = None):
+    """
+    Violations grouped by hour + alert_type for the last N hours.
+    Used for the hourly trend line chart on the analytics page.
+    """
+    cam_filter = f"AND camera_id = '{camera_id}'" if camera_id else ""
+    rows = await pool.fetch(f"""
+        SELECT
+            DATE_TRUNC('hour', created_at) AS hour,
+            alert_type,
+            COUNT(*) AS count
+        FROM alerts
+        WHERE created_at > NOW() - INTERVAL '{hours} hours'
+        {cam_filter}
+        GROUP BY hour, alert_type
+        ORDER BY hour ASC
+    """)
+    return [
+        {
+            "hour":  r["hour"].isoformat(),
+            "type":  r["alert_type"],
+            "count": r["count"],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/analytics/camera-stats")
+async def analytics_camera_stats(days: int = 7):
+    """Per-camera alert counts for the last N days — used for heatmap/bar chart."""
+    rows = await pool.fetch(f"""
+        SELECT
+            camera_id,
+            alert_type,
+            COUNT(*) AS count
+        FROM alerts
+        WHERE created_at > NOW() - INTERVAL '{days} days'
+        GROUP BY camera_id, alert_type
+        ORDER BY camera_id, count DESC
+    """)
+    return [{"camera_id": r["camera_id"], "type": r["alert_type"], "count": r["count"]}
+            for r in rows]
+
+
+# ── Incident detail ───────────────────────────────────────────────────────────
+
+@app.get("/incidents/{incident_id}")
+async def get_incident_detail(incident_id: str):
+    """Full incident detail with linked alert list."""
+    inc = await pool.fetchrow(
+        "SELECT * FROM incidents WHERE id = $1::uuid", incident_id
+    )
+    if not inc:
+        raise HTTPException(404, "Incident not found")
+
+    alert_rows = await pool.fetch(
+        """SELECT * FROM alerts WHERE incident_id = $1::uuid
+           ORDER BY created_at DESC LIMIT 100""",
+        incident_id,
+    )
+    inc_dict = dict(inc)
+    inc_dict["id"] = str(inc_dict["id"])
+    if inc_dict.get("assigned_to"):
+        inc_dict["assigned_to"] = str(inc_dict["assigned_to"])
+    for k, v in inc_dict.items():
+        if hasattr(v, "isoformat"):
+            inc_dict[k] = v.isoformat()
+
+    return {
+        **inc_dict,
+        "alerts": [_serialize_alert(r) for r in alert_rows],
+    }
+
+
+@app.post("/incidents/{incident_id}/action")
+async def update_incident(incident_id: str, body: AlertAction):
+    """Officer action on an incident (assign, close, dispatch)."""
+    valid = {"assigned", "dispatched", "closed"}
+    if body.action not in valid:
+        raise HTTPException(400, f"Invalid action. Must be one of: {valid}")
+    await pool.execute(
+        "UPDATE incidents SET status=$1 WHERE id=$2::uuid", body.action, incident_id
+    )
+    return {"incident_id": incident_id, "status": body.action}
+
+
+# ── Evidence endpoint ─────────────────────────────────────────────────────────
+
+@app.get("/evidence")
+async def list_evidence(limit: int = 50, camera_id: str | None = None, alert_type: str | None = None):
+    """
+    Alerts that have snapshot images attached — used by the Evidence page.
+    Supports filtering by camera and/or alert type.
+    """
+    clauses = ["snapshot_b64 IS NOT NULL"]
+    params: list = []
+    if camera_id:
+        params.append(camera_id)
+        clauses.append(f"camera_id = ${len(params)}")
+    if alert_type:
+        params.append(alert_type)
+        clauses.append(f"alert_type = ${len(params)}")
+    where = " AND ".join(clauses)
+    params.append(limit)
+    rows = await pool.fetch(
+        f"SELECT * FROM alerts WHERE {where} ORDER BY created_at DESC LIMIT ${len(params)}",
+        *params,
+    )
+    return [_serialize_alert(r) for r in rows]
+
+
+@app.get("/system/health")
+async def system_health():
+    """Aggregate health: DB row counts + WebSocket connections."""
+    alert_count = await pool.fetchval("SELECT COUNT(*) FROM alerts") or 0
+    camera_count = await pool.fetchval("SELECT COUNT(*) FROM cameras WHERE is_active") or 0
+    incident_count = await pool.fetchval(
+        "SELECT COUNT(*) FROM incidents WHERE status IN ('open','assigned')"
+    ) or 0
+    return {
+        "status":           "ok",
+        "ws_connections":   len(ws_manager.connections),
+        "total_alerts":     alert_count,
+        "active_cameras":   camera_count,
+        "open_incidents":   incident_count,
+    }
 
 
 @app.post("/alerts/{alert_id}/action")

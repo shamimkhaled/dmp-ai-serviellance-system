@@ -185,14 +185,52 @@ FPS_GAUGE = Gauge("traffic_fps", "Frames processed per second", ["camera_id"])
 QUEUE_DEPTH = Gauge("traffic_queue_depth", "Unprocessed frames in queue")
 
 # ── Class maps ────────────────────────────────────────────────────────────────
-COCO_CLASSES: dict[int, str] = {
-    0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
-    5: "bus", 7: "truck",
+# Full COCO 80-class map — used for detection overlay on all objects.
+COCO_80_CLASSES: dict[int, str] = {
+    0:  "person",        1:  "bicycle",       2:  "car",
+    3:  "motorcycle",    4:  "airplane",       5:  "bus",
+    6:  "train",         7:  "truck",          8:  "boat",
+    9:  "traffic light", 10: "fire hydrant",   11: "stop sign",
+    12: "parking meter", 13: "bench",          14: "bird",
+    15: "cat",           16: "dog",            17: "horse",
+    18: "sheep",         19: "cow",            20: "elephant",
+    21: "bear",          22: "zebra",          23: "giraffe",
+    24: "backpack",      25: "umbrella",       26: "handbag",
+    27: "tie",           28: "suitcase",       29: "frisbee",
+    30: "skis",          31: "snowboard",      32: "sports ball",
+    33: "kite",          34: "baseball bat",   35: "baseball glove",
+    36: "skateboard",    37: "surfboard",      38: "tennis racket",
+    39: "bottle",        40: "wine glass",     41: "cup",
+    42: "fork",          43: "knife",          44: "spoon",
+    45: "bowl",          46: "banana",         47: "apple",
+    48: "sandwich",      49: "orange",         50: "broccoli",
+    51: "carrot",        52: "hot dog",        53: "pizza",
+    54: "donut",         55: "cake",           56: "chair",
+    57: "couch",         58: "potted plant",   59: "bed",
+    60: "dining table",  61: "toilet",         62: "tv",
+    63: "laptop",        64: "mouse",          65: "remote",
+    66: "keyboard",      67: "cell phone",     68: "microwave",
+    69: "oven",          70: "toaster",        71: "sink",
+    72: "refrigerator",  73: "book",           74: "clock",
+    75: "vase",          76: "scissors",       77: "teddy bear",
+    78: "hair drier",    79: "toothbrush",
 }
+
+# Bangladesh-specific vehicle classes (fine-tuned, appended after COCO 80).
 BD_CLASSES: dict[int, str] = {
-    6: "cng", 7: "tempo", 8: "battery_van",
+    80: "cng", 81: "tempo", 82: "battery_van",
 }
-ALL_CLASSES: dict[int, str] = {**COCO_CLASSES, **BD_CLASSES}
+
+# ALL_CLASSES: every detectable label (used for annotation overlay on preview).
+ALL_CLASSES: dict[int, str] = {**COCO_80_CLASSES, **BD_CLASSES}
+
+# VIOLATION_CLASSES: subset used for the traffic violation analysis pipeline.
+# Only road users and vehicles are relevant for zone/speed/helmet checks.
+VIOLATION_CLASSES: dict[int, str] = {
+    0:  "person",      1:  "bicycle",     2:  "car",
+    3:  "motorcycle",  5:  "bus",         7:  "truck",
+    80: "cng",         81: "tempo",       82: "battery_van",
+}
 
 PARKABLE_CLASSES = {"car", "truck", "bus", "tempo", "battery_van"}
 
@@ -436,12 +474,14 @@ class BDVehicleDetector:
                 continue
             for box in res.boxes:
                 cls_id = int(box.cls[0])
-                if cls_id not in ALL_CLASSES:
-                    continue
+                # Accept all 80 COCO classes + BD classes for overlay display.
+                # Unknown class ids (e.g. from a custom model) fall back to
+                # a generic label so they still appear in the preview.
+                label = ALL_CLASSES.get(cls_id, f"class_{cls_id}")
                 dets.append(
                     Detection(
                         class_id    = cls_id,
-                        class_name  = ALL_CLASSES[cls_id],
+                        class_name  = label,
                         confidence  = float(box.conf[0]),
                         bbox_xyxy   = box.xyxy[0].tolist(),
                         frame_id    = meta["frame_seq"],
@@ -1149,13 +1189,19 @@ class TrafficWorker:
         self._fps_windows: dict[str, deque] = {}
         # Latest annotated JPEG per camera, served by the /preview MJPEG endpoint.
         self._latest_jpeg: dict[str, bytes] = {}
+        # ── Motion detection (per-camera background subtractors) ──────────────
+        self._bg_subtractors:   dict[str, cv2.BackgroundSubtractor] = {}
+        self._motion_skip_count: dict[str, int]  = {}   # consecutive no-motion frames
+        # Latest serialised detection list per camera, broadcast to WS clients
+        self._latest_detections: dict[str, list] = {}
         self._stats = {
-            "frames_processed": 0,
-            "alerts_generated": 0,
-            "cameras":          list(settings.camera_ids_fallback),
-            "model_format":     "none",
-            "use_gpu":          settings.use_gpu,
-            "frame_source":     settings.frame_source,
+            "frames_processed":   0,
+            "alerts_generated":   0,
+            "cameras":            list(settings.camera_ids_fallback),
+            "model_format":       "none",
+            "use_gpu":            settings.use_gpu,
+            "frame_source":       settings.frame_source,
+            "motion_skipped":     0,
         }
 
     async def start(self) -> None:
@@ -1423,16 +1469,48 @@ class TrafficWorker:
     # ── Batch processing ──────────────────────────────────────────────────────
     async def _process_batch(self, batch: list[dict]) -> None:
         loop = asyncio.get_running_loop()
-        t0 = time.perf_counter()
+        t0   = time.perf_counter()
+
+        # ── Motion pre-filter ────────────────────────────────────────────────
+        # Skip expensive YOLO inference on frames where no significant pixel
+        # movement is detected.  The background model is still updated each
+        # frame, and every 30th no-motion frame is forced through anyway as a
+        # safety net for very slow-moving objects.
+        active_batch: list[dict] = []
+        for meta in batch:
+            cam_id = meta["camera_id"]
+            frame  = meta["frame"]
+            # Run in executor: cv2 ops are CPU-bound but fast (<2 ms per frame)
+            has_motion, ratio = await loop.run_in_executor(
+                None, self._has_motion, frame, cam_id
+            )
+            skip_n = self._motion_skip_count.get(cam_id, 0)
+            if has_motion or skip_n >= 30:
+                # Reset skip counter and include in YOLO batch
+                self._motion_skip_count[cam_id] = 0
+                active_batch.append(meta)
+            else:
+                # No motion — update counter, refresh preview with empty overlay
+                self._motion_skip_count[cam_id] = skip_n + 1
+                self._stats["motion_skipped"] += 1
+                if self._s.preview_enabled:
+                    try:
+                        self._annotate(cam_id, frame, [], [], [])
+                    except Exception:
+                        pass
+
+        if not active_batch:
+            return
+
         try:
             detections_per_frame = await loop.run_in_executor(
-                None, self._detector.detect, batch
+                None, self._detector.detect, active_batch
             )
         except Exception as exc:
             log.error("detection_failed", error=str(exc))
             return
 
-        for i, meta in enumerate(batch):
+        for i, meta in enumerate(active_batch):
             camera_id   = meta["camera_id"]
             frame       = meta["frame"]
             frame_seq   = meta["frame_seq"]
@@ -1449,7 +1527,6 @@ class TrafficWorker:
                     frame_seq=frame_seq,
                     error=str(exc),
                 )
-                # Error isolation: continue with next camera
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         INFERENCE_LATENCY.observe(elapsed_ms)
@@ -1464,9 +1541,14 @@ class TrafficWorker:
     ) -> None:
         loop = asyncio.get_running_loop()
 
-        # Track
+        # Only pass road-user / vehicle classes into DeepSORT and the violation
+        # analyzer.  All detections (all 80 COCO classes) are kept for the
+        # annotation overlay (_annotate receives the full `dets` list below).
+        violation_dets = [d for d in dets if d.class_id in VIOLATION_CLASSES]
+
+        # Track (violation classes only — tracker doesn't need benches or cats)
         tracks = await loop.run_in_executor(
-            None, self._tracker.update, camera_id, dets, frame
+            None, self._tracker.update, camera_id, violation_dets, frame
         )
 
         # Helmet check (motorcycle-specific)
@@ -1492,7 +1574,7 @@ class TrafficWorker:
                     await self._publisher.publish(v, anpr, frame, camera_id)
                     self._stats["alerts_generated"] += 1
 
-        # Zone violations
+        # Zone violations (violation classes only)
         violations = await loop.run_in_executor(
             None, self._analyzer.analyze, camera_id, tracks, frame_seq, ts_ms
         )
@@ -1519,12 +1601,25 @@ class TrafficWorker:
             win.popleft()
         FPS_GAUGE.labels(camera_id=camera_id).set(float(len(win)))
 
-        # Live preview: draw boxes on the frame and cache it for /preview.
+        # Live preview: annotate with ALL detections (all 80 COCO classes) so
+        # every detected object gets a bounding box, not just vehicles.
         if self._s.preview_enabled:
             try:
                 self._annotate(camera_id, frame, dets, tracks, violations)
             except Exception as exc:
                 log.debug("annotate_failed", camera_id=camera_id, error=str(exc))
+
+        # Broadcast structured detection data to WebSocket subscribers so the
+        # dashboard can render canvas overlays on the live low-latency stream.
+        if detection_subscribers.get(camera_id):
+            try:
+                payload = self._build_det_payload(camera_id, dets, tracks, violations, frame)
+                self._latest_detections[camera_id] = payload["detections"]
+                asyncio.create_task(
+                    self._broadcast_detections_ws(camera_id, json.dumps(payload))
+                )
+            except Exception as exc:
+                log.debug("ws_broadcast_failed", camera_id=camera_id, error=str(exc))
 
     def _annotate(
         self,
@@ -1540,6 +1635,7 @@ class TrafficWorker:
         # Prefer confirmed tracks (with IDs); fall back to raw detections so
         # boxes appear immediately before DeepSORT confirms a track.
         if tracks:
+            # Confirmed tracks: show class + track ID; red for violators.
             for tk in tracks:
                 x1, y1, x2, y2 = (int(v) for v in tk["bbox_xyxy"])
                 is_viol = tk["track_id"] in viol_ids
@@ -1550,8 +1646,25 @@ class TrafficWorker:
                     (x1, max(y1 - 6, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
                 )
-            object_count = len(tracks)
+
+            # Also draw any non-violation-class detections (people, animals,
+            # objects) that DeepSORT never saw — they're real detections too.
+            tracked_approx = {
+                (int(tk["bbox_xyxy"][0]), int(tk["bbox_xyxy"][1])) for tk in tracks
+            }
+            for d in dets:
+                if d.class_id in VIOLATION_CLASSES:
+                    continue  # already drawn via tracks above
+                x1, y1, x2, y2 = (int(v) for v in d.bbox_xyxy)
+                cv2.rectangle(img, (x1, y1), (x2, y2), (255, 165, 0), 1)
+                cv2.putText(
+                    img, f"{d.class_name} {d.confidence:.2f}",
+                    (x1, max(y1 - 6, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 165, 0), 1,
+                )
+            object_count = len(dets)
         else:
+            # No confirmed tracks yet — draw all raw detections.
             for d in dets:
                 x1, y1, x2, y2 = (int(v) for v in d.bbox_xyxy)
                 cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 0), 2)
@@ -1578,6 +1691,104 @@ class TrafficWorker:
         if self._pool:
             await self._pool.close()
         log.info("worker_stopped")
+
+    # ── Motion detection helpers ──────────────────────────────────────────────
+
+    def _get_bg_subtractor(self, camera_id: str) -> cv2.BackgroundSubtractor:
+        if camera_id not in self._bg_subtractors:
+            self._bg_subtractors[camera_id] = cv2.createBackgroundSubtractorMOG2(
+                history=500, varThreshold=50, detectShadows=False
+            )
+        return self._bg_subtractors[camera_id]
+
+    def _has_motion(self, frame: np.ndarray, camera_id: str, min_area: int = 1500) -> tuple[bool, float]:
+        """
+        Returns (has_motion, motion_ratio).
+
+        Always feeds the frame to the background model so the model stays
+        updated even on skipped frames.  Only returns True when movement
+        covering > 0.3 % of the frame is detected after morphological cleanup.
+        """
+        bgsub = self._get_bg_subtractor(camera_id)
+        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        fg    = bgsub.apply(gray)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel)
+        contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        motion_px = sum(cv2.contourArea(c) for c in contours if cv2.contourArea(c) > min_area)
+        ratio = motion_px / max(frame.shape[0] * frame.shape[1], 1)
+        return ratio > 0.003, round(ratio, 5)
+
+    # ── Detection WebSocket broadcast ─────────────────────────────────────────
+
+    def _build_det_payload(
+        self,
+        camera_id:  str,
+        dets:       list,
+        tracks:     list,
+        violations: list,
+        frame:      np.ndarray,
+    ) -> dict:
+        """Serialise detections + tracks into a JSON-safe dict for WS clients."""
+        viol_map: dict[int, str] = {v.track_id: v.alert_type for v in violations}
+        items: list[dict] = []
+
+        if tracks:
+            for tk in tracks:
+                x1, y1, x2, y2 = [int(v) for v in tk["bbox_xyxy"]]
+                items.append({
+                    "bbox":       [x1, y1, x2, y2],
+                    "class":      tk["class_name"],
+                    "track_id":   tk["track_id"],
+                    "confidence": round(float(tk.get("confidence", 0.8)), 2),
+                    "violation":  viol_map.get(tk["track_id"]),
+                })
+            # Non-vehicle detections not handled by DeepSORT
+            tracked_cls = {c for c in VIOLATION_CLASSES}
+            for d in dets:
+                if d.class_id in tracked_cls:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in d.bbox_xyxy]
+                items.append({
+                    "bbox":       [x1, y1, x2, y2],
+                    "class":      d.class_name,
+                    "track_id":   None,
+                    "confidence": round(float(d.confidence), 2),
+                    "violation":  None,
+                })
+        else:
+            for d in dets:
+                x1, y1, x2, y2 = [int(v) for v in d.bbox_xyxy]
+                items.append({
+                    "bbox":       [x1, y1, x2, y2],
+                    "class":      d.class_name,
+                    "track_id":   None,
+                    "confidence": round(float(d.confidence), 2),
+                    "violation":  None,
+                })
+
+        return {
+            "type":        "detections",
+            "camera_id":   camera_id,
+            "ts":          int(time.time() * 1000),
+            "frame_w":     frame.shape[1],
+            "frame_h":     frame.shape[0],
+            "detections":  items,
+            "object_count": len(items),
+        }
+
+    async def _broadcast_detections_ws(self, camera_id: str, payload_str: str) -> None:
+        """Fire-and-forget send to all WebSocket subscribers for this camera."""
+        subs = detection_subscribers.get(camera_id)
+        if not subs:
+            return
+        dead: set = set()
+        for ws in list(subs):
+            try:
+                await ws.send_str(payload_str)
+            except Exception:
+                dead.add(ws)
+        subs -= dead
 
 
 # ── Inline FrameStream (fallback when video_ingest not on path) ───────────────
@@ -1620,6 +1831,9 @@ class _LocalFrameStream:
 
 # ── FastAPI health / metrics server ───────────────────────────────────────────
 _worker_ref: TrafficWorker | None = None
+
+# Camera-id → set of live aiohttp WebSocket connections for detection streaming
+detection_subscribers: dict[str, set] = {}
 
 
 async def _health_handler(_: web.Request) -> web.Response:
@@ -1696,14 +1910,116 @@ async def _preview_stream(request: web.Request) -> web.StreamResponse:
     return resp
 
 
+async def _detection_ws_handler(request: web.Request) -> web.WebSocketResponse:
+    """
+    WebSocket endpoint: `GET /detections/{camera_id}/ws`
+
+    The dashboard connects here to receive real-time structured detection data
+    (bounding boxes, class labels, track IDs, violations) without the overhead
+    of re-encoding a full MJPEG stream.  The frontend draws bboxes on a
+    <canvas> overlay on top of the low-latency WebRTC/HLS live stream.
+
+    Each message is a JSON object:
+    {
+      "type":        "detections",
+      "camera_id":   "cam01",
+      "ts":          1718000000000,   // epoch ms
+      "frame_w":     1280,
+      "frame_h":     720,
+      "object_count": 3,
+      "detections":  [
+        {"bbox": [x1,y1,x2,y2], "class": "car", "track_id": 42,
+         "confidence": 0.87, "violation": "red_light_violation"},
+        ...
+      ]
+    }
+    """
+    cam_id = request.match_info["camera_id"]
+    ws = web.WebSocketResponse(heartbeat=20)
+    await ws.prepare(request)
+
+    # Register subscriber
+    if cam_id not in detection_subscribers:
+        detection_subscribers[cam_id] = set()
+    detection_subscribers[cam_id].add(ws)
+    log.info("detection_ws_connected", camera_id=cam_id,
+             subscribers=len(detection_subscribers[cam_id]))
+
+    # Send last known detection snapshot immediately on connect
+    if _worker_ref and cam_id in _worker_ref._latest_detections:
+        try:
+            snap = {
+                "type":       "detections",
+                "camera_id":  cam_id,
+                "ts":         int(time.time() * 1000),
+                "frame_w":    640, "frame_h": 360,
+                "detections": _worker_ref._latest_detections[cam_id],
+                "object_count": len(_worker_ref._latest_detections[cam_id]),
+            }
+            await ws.send_str(json.dumps(snap))
+        except Exception:
+            pass
+
+    try:
+        async for msg in ws:
+            # Clients may send "ping" keep-alives
+            if msg.type == web.WSMsgType.TEXT and msg.data == "ping":
+                await ws.send_str("pong")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        detection_subscribers.get(cam_id, set()).discard(ws)
+        log.info("detection_ws_disconnected", camera_id=cam_id)
+
+    return ws
+
+
+async def _detection_snapshot_handler(request: web.Request) -> web.Response:
+    """GET /detections/{camera_id}/latest — latest detections as JSON (no WS needed)."""
+    cam_id = request.match_info["camera_id"]
+    dets = _worker_ref._latest_detections.get(cam_id, []) if _worker_ref else []
+    return web.json_response({
+        "camera_id":   cam_id,
+        "ts":          int(time.time() * 1000),
+        "detections":  dets,
+        "object_count": len(dets),
+    })
+
+
+async def _motion_stats_handler(_: web.Request) -> web.Response:
+    """GET /motion/stats — per-camera motion skip counts for diagnostics."""
+    if not _worker_ref:
+        return web.json_response({"error": "worker not ready"}, status=503)
+    return web.json_response({
+        cam: {
+            "skip_count": _worker_ref._motion_skip_count.get(cam, 0),
+            "total_skipped": _worker_ref._stats.get("motion_skipped", 0),
+        }
+        for cam in _worker_ref._cameras
+    })
+
+
 async def _start_health_server(port: int) -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/health",  _health_handler)
-    app.router.add_get("/metrics", _metrics_handler)
-    app.router.add_get("/",        _preview_index)
-    app.router.add_get("/preview", _preview_index)
-    app.router.add_get("/preview/{camera_id}", _preview_stream)
-    runner = web.AppRunner(app)
+    sapp = web.Application()
+    # CORS for dashboard (all origins in dev)
+    async def _cors(request: web.Request, handler):
+        resp = await handler(request)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        return resp
+    sapp.middlewares.append(_cors)
+
+    sapp.router.add_get("/health",   _health_handler)
+    sapp.router.add_get("/metrics",  _metrics_handler)
+    sapp.router.add_get("/",         _preview_index)
+    sapp.router.add_get("/preview",  _preview_index)
+    sapp.router.add_get("/preview/{camera_id}", _preview_stream)
+    # Detection WebSocket and REST snapshot
+    sapp.router.add_get("/detections/{camera_id}/ws",     _detection_ws_handler)
+    sapp.router.add_get("/detections/{camera_id}/latest", _detection_snapshot_handler)
+    sapp.router.add_get("/motion/stats", _motion_stats_handler)
+
+    runner = web.AppRunner(sapp)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
     log.info("health_server_started", port=port)

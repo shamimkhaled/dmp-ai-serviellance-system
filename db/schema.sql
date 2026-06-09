@@ -77,6 +77,7 @@ CREATE TABLE alerts (
     confidence      DECIMAL(5,4) NOT NULL,
     severity        SMALLINT CHECK (severity BETWEEN 1 AND 4),
     snapshot_path   VARCHAR(255),
+    snapshot_b64    TEXT,              -- base64 JPEG of the violation crop (for dashboard display)
     clip_path       VARCHAR(255),
     object_metadata JSONB,                  -- bbox, track_id, vehicle_type, etc.
     location_name   VARCHAR(100),
@@ -193,3 +194,29 @@ INSERT INTO cameras (camera_id, name, rtsp_url, location_name, zone_type, brand,
 VALUES
     ('cam01', 'Main Gate Camera', 'rtsp://localhost:8554/cam01',
      'Main Gate', 'entry_exit', 'custom', 'publish');
+
+-- ── Seed: demo detection zones for cam01 ──────
+-- All polygon/line coordinates are normalised 0-1 relative to the 640×640
+-- inference frame.  Adjust to match actual camera layout before deployment.
+INSERT INTO camera_zones
+    (camera_id, zone_type, zone_name,
+     polygon_points_json, stop_line_y, lane_boundary_json,
+     speed_limit_kmh, speed_cal_ppm, camera_direction, is_active)
+VALUES
+    -- Red-light box: upper-centre of frame (intersection stop zone)
+    ('cam01', 'red_light', 'Main Gate Red Light',
+     '[[0.3,0.1],[0.7,0.1],[0.7,0.45],[0.3,0.45]]',
+     NULL, NULL,
+     60, 100.0, 'down', TRUE),
+
+    -- Stop line: horizontal line at 65% of frame height
+    ('cam01', 'stop_line', 'Main Gate Stop Line',
+     NULL,
+     0.65, NULL,
+     60, 100.0, 'down', TRUE),
+
+    -- No-parking zone: lower-left quadrant (shoulder area)
+    ('cam01', 'no_parking', 'Main Gate No-Parking',
+     '[[0.0,0.6],[0.25,0.6],[0.25,1.0],[0.0,1.0]]',
+     NULL, NULL,
+     60, 100.0, 'down', TRUE);

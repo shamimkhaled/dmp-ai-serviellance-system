@@ -1,12 +1,20 @@
 """
-traffic_ai/worker.py
-────────────────────
-Traffic violation AI worker.
-- Reads frames from MediaMTX RTSP streams
-- Runs YOLO v8 inference (TensorRT in production)
-- Detects: red light, wrong lane, helmet, speeding, parking violations
-- Publishes alert candidates to Redis Streams
-- MOCK_MODE=true generates synthetic alerts (for local dev without GPU)
+traffic_ai/worker.py  [LEGACY — DO NOT USE]
+───────────────────────────────────────────
+This is the original simplified mock worker kept for reference only.
+The active entry point is traffic_ai_worker.py (see Dockerfile CMD).
+
+traffic_ai_worker.py supersedes this file with:
+  - Full 80-class COCO detection + 3 Bangladesh-specific classes
+  - DeepSORT multi-object tracking
+  - Zone-based violation analysis (red light, stop line, wrong lane,
+    no parking, speed) loaded from camera_zones DB table
+  - PaddleOCR ANPR plate reading
+  - Annotated MJPEG preview endpoint (/preview/{camera_id}.mjpg)
+  - Prometheus metrics + structured JSON logging
+  - FRAME_SOURCE=rtsp|queue|mock selection via env var
+
+Do not add features here.  Modify traffic_ai_worker.py instead.
 """
 
 import asyncio
