@@ -56,6 +56,10 @@ services:
       - "8189:8189/tcp"   # WebRTC ICE fallback (restrictive networks)
       - "8888:8888"       # HLS
       - "9997:9997"       # API
+    environment:
+      # Overrides webrtcAdditionalHosts from mediamtx.yml — must be the IP/hostname
+      # browsers use to reach this server, or WebRTC/WHEP ICE negotiation fails.
+      MTX_WEBRTCADDITIONALHOSTS: ${HOST_IP:-127.0.0.1}
     volumes:
       - ./services/video-ingest/mediamtx.yml:/mediamtx.yml
     healthcheck:
@@ -99,9 +103,9 @@ services:
       DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
       MEDIAMTX_URL: http://mediamtx:9997
       RTSP_BASE_URL: rtsp://mediamtx:8554
-      WHEP_BASE_URL: http://localhost:8889
-      HLS_BASE_URL: http://localhost:8888
-      PUBLIC_RTSP_URL: rtsp://localhost:8554
+      WHEP_BASE_URL: http://${HOST_IP:-localhost}:8889
+      HLS_BASE_URL: http://${HOST_IP:-localhost}:8888
+      PUBLIC_RTSP_URL: rtsp://${HOST_IP:-localhost}:8554
     ports:
       - "8001:8001"
 
@@ -223,11 +227,11 @@ services:
     depends_on:
       - alert-service
     environment:
-      VITE_ALERT_SERVICE_URL: http://localhost:8004
-      VITE_VIDEO_INGEST_URL: http://localhost:8001
-      VITE_MEDIAMTX_WHEP_URL: http://localhost:8889
-      VITE_MEDIAMTX_HLS_URL: http://localhost:8888
-      VITE_TRAFFIC_AI_URL: http://localhost:8002
+      VITE_ALERT_SERVICE_URL: http://${HOST_IP:-localhost}:8004
+      VITE_VIDEO_INGEST_URL: http://${HOST_IP:-localhost}:8001
+      VITE_MEDIAMTX_WHEP_URL: http://${HOST_IP:-localhost}:8889
+      VITE_MEDIAMTX_HLS_URL: http://${HOST_IP:-localhost}:8888
+      VITE_TRAFFIC_AI_URL: http://${HOST_IP:-localhost}:8002
     ports:
       - "3000:3000"
     volumes:
