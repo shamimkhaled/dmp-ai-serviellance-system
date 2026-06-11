@@ -402,7 +402,7 @@ export function CameraGrid({ language }) {
           <div className="form-row">
             <label>{t("ক্যামেরা ID", "Camera ID")}</label>
             <input required readOnly={!!editingId} minLength={2} maxLength={32}
-              pattern="^[-a-zA-Z0-9_]{2,32}$" placeholder="cam05"
+              pattern="^[a-zA-Z0-9_-]{2,32}$" placeholder="cam05"
               value={form.camera_id} onChange={e => setForm({ ...form, camera_id: e.target.value })} />
           </div>
           <div className="form-row">
