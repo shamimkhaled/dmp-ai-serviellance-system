@@ -57,11 +57,7 @@ rsync -avz --exclude node_modules --exclude .git \
 
 ---
 
-## 3. Configure the server's IP
-
-The dashboard, MediaMTX (WebRTC/WHEP) and video-ingest all need to know the
-IP/hostname that **operator browsers** will use to reach this server. This
-is now controlled by a single `HOST_IP` variable.
+## 3. Configure the server's IP and database
 
 On the server:
 
@@ -70,7 +66,11 @@ cd ~/police-ai-starter
 cp .env.example .env
 ```
 
-Edit `.env` and set `HOST_IP` to the server's reachable IP, e.g.:
+### 3a. `HOST_IP`
+
+The dashboard, MediaMTX (WebRTC/WHEP) and video-ingest all need to know the
+IP/hostname that **operator browsers** will use to reach this server. This
+is controlled by a single `HOST_IP` variable. Edit `.env`:
 
 ```
 HOST_IP=172.19.1.8
@@ -84,6 +84,36 @@ This single value feeds:
 
 If `.env` is absent or `HOST_IP` is unset, everything falls back to
 `localhost` / `127.0.0.1` (local-dev behavior, unchanged).
+
+### 3b. `DATABASE_URL` (external PostgreSQL)
+
+This stack does **not** bundle its own PostgreSQL container — every service
+(`video-ingest`, `traffic-ai`, `face-ai`, `alert-service`, `drafting`)
+connects directly to an external/managed PostgreSQL server (with the
+`pgvector` extension available). `DATABASE_URL` is **required** — services
+will fail to start without it.
+
+Edit `.env`:
+
+```
+DATABASE_URL=postgresql://dmp_user:DMPAI2026@103.146.220.225:5432/dmp_db
+```
+
+Before the first start, apply the schema to that database **once**:
+
+```bash
+psql "postgresql://dmp_user:DMPAI2026@103.146.220.225:5432/dmp_db" -f db/schema.sql
+```
+
+This requires the `vector` and `uuid-ossp` extensions to be installable on
+that server (`CREATE EXTENSION IF NOT EXISTS vector;` — the `pgvector`
+extension package must be installed on the Postgres server itself, e.g.
+`apt install postgresql-16-pgvector` or use a `pgvector/pgvector` image if
+that server is also containerized).
+
+On subsequent deploys, `alert-service` runs idempotent
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migrations on startup, so you
+don't need to re-run `schema.sql` for small additive changes.
 
 ---
 
@@ -106,8 +136,11 @@ The stack exposes these ports on the host:
 | 8889        | mediamtx         | WebRTC/WHEP signaling                  |
 | 8189 udp/tcp| mediamtx         | WebRTC ICE media — required for video  |
 | 9997        | mediamtx         | MediaMTX API                           |
-| 5432        | postgres         | DB (keep internal-only unless needed)  |
 | 6379        | redis            | Redis (keep internal-only unless needed)|
+
+> PostgreSQL (5432) is on the external DB server (103.146.220.225), not this
+> host — ensure that server's firewall allows inbound connections from this
+> VM's IP, but does **not** expose 5432 to the public internet.
 
 Using `ufw`:
 
@@ -173,8 +206,9 @@ double-check `HOST_IP` in `.env` matches the IP you're browsing from, then
 The default `docker-compose.yml` ships with **dev-only secrets**. Before
 exposing this to real traffic, change:
 
-- `POSTGRES_PASSWORD` (currently `policeai_dev_secret`) — also update
-  `DATABASE_URL` in every service that references it
+- The external PostgreSQL credentials in `DATABASE_URL` — make sure that
+  user has access only to `dmp_db`, and that the DB server's firewall only
+  allows connections from this VM (and any other trusted hosts)
 - `JWT_SECRET` in `alert-service` (currently `dev_jwt_secret_change_in_prod`)
 - `KEYCLOAK_ADMIN_PASSWORD` (currently `admin`)
 - MediaMTX `authMethod: internal` / `authInternalUsers` in
@@ -183,7 +217,7 @@ exposing this to real traffic, change:
 
 Also consider:
 - Putting nginx behind TLS (Let's Encrypt / reverse proxy with HTTPS)
-- Restricting Postgres/Redis ports to localhost (`127.0.0.1:5432:5432`)
+- Restricting the Redis port to localhost (`127.0.0.1:6379:6379`)
 - Setting up SSH key-based auth for the server and disabling password auth
 
 ---

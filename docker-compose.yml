@@ -1,30 +1,15 @@
 # ─────────────────────────────────────────────
-# Police AI – Local Development Stack
+# Police AI – Application Stack
 # Run: docker compose up -d
 # No GPU required for local dev (mock AI workers)
+#
+# Requires DATABASE_URL pointing at an external PostgreSQL server with
+# pgvector installed (see .env.example + DEPLOYMENT.md). Apply db/schema.sql
+# to that database once before first start — it is no longer auto-applied
+# by a bundled postgres container.
 # ─────────────────────────────────────────────
 
 services:
-
-  # ── PostgreSQL (primary data store + audit log) ──
-  postgres:
-    image: pgvector/pgvector:pg16
-    container_name: pai_postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: policeai
-      POSTGRES_USER: policeai
-      POSTGRES_PASSWORD: policeai_dev_secret
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U policeai"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   # ── Redis Streams (alert queue + pub/sub) ──
   redis:
@@ -95,12 +80,10 @@ services:
     container_name: pai_video_ingest
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
       mediamtx:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      DATABASE_URL: ${DATABASE_URL}
       MEDIAMTX_URL: http://mediamtx:9997
       RTSP_BASE_URL: rtsp://mediamtx:8554
       WHEP_BASE_URL: http://${HOST_IP:-localhost}:8889
@@ -118,15 +101,13 @@ services:
     container_name: pai_traffic_ai
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
       video-ingest:
         condition: service_started
     environment:
       REDIS_URL: redis://redis:6379
-      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      DATABASE_URL: ${DATABASE_URL}
       RTSP_BASE_URL: rtsp://mediamtx:8554
       VIDEO_INGEST_URL: http://video-ingest:8001
       # FRAME_SOURCE: rtsp = live MediaMTX streams (real detection on all cameras)
@@ -152,10 +133,9 @@ services:
     restart: unless-stopped
     depends_on:
       - redis
-      - postgres
     environment:
       REDIS_URL: redis://redis:6379
-      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      DATABASE_URL: ${DATABASE_URL}
       RTSP_BASE_URL: rtsp://mediamtx:8554
       MOCK_MODE: "true"
       FACE_MATCH_THRESHOLD: "0.75"
@@ -171,12 +151,10 @@ services:
     container_name: pai_alert_service
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: redis://redis:6379
       JWT_SECRET: dev_jwt_secret_change_in_prod
       DEDUP_WINDOW_SECONDS: "30"
@@ -191,11 +169,8 @@ services:
       network: host
     container_name: pai_drafting
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://policeai:policeai_dev_secret@postgres:5432/policeai
+      DATABASE_URL: ${DATABASE_URL}
       LLM_API_URL: http://host.docker.internal:11434
       LLM_MODEL: llama3.1:8b
     extra_hosts:
@@ -253,5 +228,4 @@ services:
       - ./infra/nginx.conf:/etc/nginx/conf.d/default.conf
 
 volumes:
-  postgres_data:
   redis_data:
