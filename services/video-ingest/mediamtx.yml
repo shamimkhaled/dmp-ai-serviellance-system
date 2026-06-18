@@ -87,23 +87,6 @@ pathDefaults:
 ###############################################################################
 paths:
 
-  # Fake camera (ffmpeg test source) pushes here.
-  cam01:
-    source:         publisher
-    sourceOnDemand: false
-
-  cam02:
-    source:         publisher
-    sourceOnDemand: false
-
-  cam03:
-    source:         publisher
-    sourceOnDemand: false
-
-  cam04:
-    source:         publisher
-    sourceOnDemand: false
-
   # Catch-all for cameras registered dynamically by the ingest service.
   "~^cam[0-9]+$":
     source:         publisher

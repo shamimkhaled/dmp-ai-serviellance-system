@@ -9,6 +9,8 @@ const ALERT_SERVICE_URL  = import.meta.env.VITE_ALERT_SERVICE_URL  || "http://lo
 const VIDEO_INGEST_URL   = import.meta.env.VITE_VIDEO_INGEST_URL   || "http://localhost:8001";
 const TRAFFIC_AI_URL     = import.meta.env.VITE_TRAFFIC_AI_URL     || "http://localhost:8002";
 const WS_URL             = ALERT_SERVICE_URL.replace("http", "ws");
+const OFFICER_ID         = import.meta.env.VITE_OFFICER_ID         || "operator-001";
+const OFFICER_NAME       = import.meta.env.VITE_OFFICER_NAME       || "Operator";
 
 // ── Navigation items ──────────────────────────────────────────────────────────
 const NAV_ITEMS = [
@@ -89,7 +91,7 @@ export default function App() {
   const [language,    setLanguage]    = useState("bn");
   const [activeTab,   setActiveTab]   = useState("command");
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [officer]                     = useState({ id: "demo-officer-001", name: "Demo Officer", role: "operator" });
+  const [officer]                     = useState({ id: OFFICER_ID, name: OFFICER_NAME, role: "operator" });
 
   const { alerts, incidents, acceptAlert, rejectAlert, escalateAlert, handleWsMessage } =
     useAlerts(ALERT_SERVICE_URL, officer.id);

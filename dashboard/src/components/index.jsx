@@ -1305,7 +1305,7 @@ RTSP Camera ──► MediaMTX (:8554)
                          ┌──────────┴──────────┐
                          ▼                     ▼
                   MJPEG preview         Detection WS
-                 /preview/cam1    /detections/cam1/ws
+                 /preview/{camera_id}.mjpg    /detections/{camera_id}/ws
                  <img> tag        Canvas overlay on <video>
                  server-annotated  client-drawn bboxes`.trim()}</pre>
       </div>

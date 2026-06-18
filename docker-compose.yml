@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────
 # Police AI – Application Stack
 # Run: docker compose up -d
-# No GPU required for local dev (mock AI workers)
+# No GPU required for CPU inference (set USE_GPU=true on GPU nodes)
 #
 # Requires DATABASE_URL pointing at an external PostgreSQL server with
 # pgvector installed (see .env.example + DEPLOYMENT.md). Apply db/schema.sql
@@ -53,24 +53,6 @@ services:
       timeout: 5s
       retries: 3
 
-  # ── Fake RTSP camera (for local dev — loops a test video) ──
-  fake-camera:
-    image: linuxserver/ffmpeg:latest
-    container_name: pai_fake_camera
-    restart: unless-stopped
-    depends_on:
-      mediamtx:
-        condition: service_healthy
-    entrypoint:
-      - sh
-      - -c
-      - >
-        ffmpeg -re -stream_loop -1
-        -f lavfi -i testsrc2=size=1280x720:rate=25
-        -c:v libx264 -preset ultrafast -tune zerolatency
-        -b:v 1M -maxrate 1M -bufsize 2M
-        -an -f rtsp rtsp://mediamtx:8554/cam01
-
   # ── Video ingest service (camera registry + health) ──
   video-ingest:
     build:
@@ -89,10 +71,12 @@ services:
       WHEP_BASE_URL: http://${HOST_IP:-localhost}:8889
       HLS_BASE_URL: http://${HOST_IP:-localhost}:8888
       PUBLIC_RTSP_URL: rtsp://${HOST_IP:-localhost}:8554
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8001:8001"
 
-  # ── Traffic AI worker (YOLO — mock in local dev) ──
+  # ── Traffic AI worker (YOLO) ──
   traffic-ai:
     build:
       context: ./services/traffic-ai
@@ -110,20 +94,18 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       RTSP_BASE_URL: rtsp://mediamtx:8554
       VIDEO_INGEST_URL: http://video-ingest:8001
-      # FRAME_SOURCE: rtsp = live MediaMTX streams (real detection on all cameras)
-      #               mock = synthetic alerts | queue = ingest_pipeline multiprocessing.Queue
       FRAME_SOURCE: "rtsp"
-      USE_GPU: "false"            # CPU dev box; set "true" on Node A (A100 + CUDA 12)
-      CAMERA_IDS: "cam01"         # fallback only — cameras auto-discovered from DB + video-ingest
+      USE_GPU: "false"            # set "true" on GPU nodes (A100 + CUDA 12)
       TRAFFIC_CONF_THRESHOLD: "0.35"
       CAMERA_FPS: "10"
       LOG_LEVEL: "INFO"
-      INJECT_TEST_VIOLATIONS: "false"
-      ANPR_ENABLED: "false"       # plate OCR (PaddleOCR) — heavy; enable on GPU node (Node A)
+      ANPR_ENABLED: "false"       # plate OCR (PaddleOCR) — heavy; enable on GPU nodes
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8002:8002"
 
-  # ── Face recognition worker (InsightFace — mock in local dev) ──
+  # ── Face recognition worker (InsightFace) ──
   face-ai:
     build:
       context: ./services/face-ai
@@ -137,8 +119,10 @@ services:
       REDIS_URL: redis://redis:6379
       DATABASE_URL: ${DATABASE_URL}
       RTSP_BASE_URL: rtsp://mediamtx:8554
-      MOCK_MODE: "true"
+      MOCK_MODE: "false"
       FACE_MATCH_THRESHOLD: "0.75"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8003:8003"
 
@@ -158,6 +142,8 @@ services:
       REDIS_URL: redis://redis:6379
       JWT_SECRET: dev_jwt_secret_change_in_prod
       DEDUP_WINDOW_SECONDS: "30"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8004:8004"
 
