@@ -39,6 +39,12 @@ BRAND_TEMPLATES: dict[str, dict] = {
         "default_port": 554,
         "notes": "video1 = main stream on most models.",
     },
+    "eyenor": {
+        "label": "Eyenor",
+        "template": "rtsp://{auth}{host}:{port}/h264/ch{channel}/main/av_stream",
+        "default_port": 554,
+        "notes": "Main stream: /h264/ch1/main/av_stream. Use Custom URL for sub stream.",
+    },
     "onvif": {
         "label": "ONVIF / Generic",
         "template": "rtsp://{auth}{host}:{port}/onvif1",

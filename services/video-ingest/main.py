@@ -143,6 +143,38 @@ async def _migrate(pg: asyncpg.Pool) -> None:
     for sql in stmts:
         await pg.execute(sql)
     log.info("db_migrations_applied")
+    await _seed_builtin_cameras(pg)
+
+
+async def _seed_builtin_cameras(pg: asyncpg.Pool) -> None:
+    """Register statically configured cameras so the dashboard and AI workers see them.
+
+    Insert-only: later dashboard edits are not overwritten on restart.
+    """
+    eyenor_rtsp = os.getenv(
+        "EYENOR_CAM1_RTSP",
+        "rtsp://admin:123456@172.19.1.3:554/h264/ch1/main/av_stream",
+    )
+    result = await pg.execute(
+        """INSERT INTO cameras
+           (camera_id, name, rtsp_url, brand, connection_mode, host, port,
+            username, channel, location_name, zone_type, active)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE)
+           ON CONFLICT (camera_id) DO NOTHING""",
+        "eyenor_cam1",
+        "Eyenor Cam 1",
+        eyenor_rtsp,
+        "eyenor",
+        "pull",
+        "172.19.1.3",
+        554,
+        "admin",
+        1,
+        "Eyenor Cam 1",
+        "facility",
+    )
+    if result.split()[-1] == "1":
+        log.info("builtin_camera_seeded", camera_id="eyenor_cam1")
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
