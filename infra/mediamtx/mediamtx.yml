@@ -81,6 +81,8 @@ hls: yes
 
 # Same bind-all — accessed via nginx proxy from the dashboard.
 hlsAddress: :8888
+hlsAllowOrigins: ["*"]
+hlsAlwaysRemux: yes
 
 # 7 × 1 s segments = 7 s rolling buffer.  Low enough for near-real-time
 # monitoring; large enough to survive brief I/O spikes.
@@ -170,6 +172,13 @@ pathDefaults:
 #   http://<node>:8889/<camID>/whep
 
 paths:
+
+  # Eyenor IP camera — always-on pull (path name is not camNN).
+  eyenor_cam1:
+    source:          rtsp://admin:123456@172.19.1.3:554/h264/ch1/main/av_stream
+    sourceOnDemand:  no
+    rtspTransport:   tcp
+    <<: *recording
 
   # ── Explicit paths (cam01–cam04 always present; adjust as deployed) ──────
   cam01:
