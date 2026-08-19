@@ -289,6 +289,7 @@ const FALLBACK_BRANDS = [
   { id: "tplink",    label: "TP-Link / Tapo",  notes: "IP + username + password" },
   { id: "reolink",   label: "Reolink",         notes: "IP + username + password" },
   { id: "uniview",   label: "Uniview",         notes: "IP + username + password" },
+  { id: "eyenor",    label: "Eyenor",          notes: "IP + username + password; /h264/ch1/main/av_stream" },
   { id: "onvif",     label: "ONVIF / Generic", notes: "Common ONVIF path" },
   { id: "custom",    label: "Custom URL",      notes: "Paste full RTSP URL from camera manual" },
 ];
