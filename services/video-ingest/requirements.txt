@@ -4,6 +4,7 @@ asyncpg
 httpx
 opencv-python-headless
 pydantic>=2
+PyJWT[crypto]>=2.8.0
 
 # ingest_pipeline.py (frame distribution service)
 numpy

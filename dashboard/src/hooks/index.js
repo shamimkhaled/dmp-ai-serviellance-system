@@ -42,23 +42,31 @@ export function useAlerts(apiUrl, officerId) {
     }
   }, []);
 
-  async function performAction(alertId, action, notes = null) {
+  async function performAction(alertId, action, extra = {}) {
     try {
       await fetch(`${apiUrl}/alerts/${alertId}/action`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ action, notes, officer_id: officerId }),
+        body:    JSON.stringify({ action, officer_id: officerId, ...extra }),
       });
-      setAlerts(prev => prev.map(a => a.alert_id === alertId ? { ...a, status: action } : a));
+      const { notes, assigned_to, statusHint, ..._rest } = extra;
+      setAlerts(prev => prev.map(a => a.alert_id === alertId ? {
+        ...a,
+        status: statusHint || action,
+        assigned_to: assigned_to || a.assigned_to,
+      } : a));
     } catch {}
   }
 
   return {
     alerts, incidents, handleWsMessage,
-    acceptAlert:   (id) => performAction(id, "accepted"),
-    rejectAlert:   (id) => performAction(id, "rejected"),
-    escalateAlert: (id) => performAction(id, "escalated"),
-    closeAlert:    (id) => performAction(id, "closed"),
+    acceptAlert:      (id) => performAction(id, "acknowledge", { statusHint: "acknowledged" }),
+    rejectAlert:      (id) => performAction(id, "rejected"),
+    escalateAlert:    (id) => performAction(id, "escalated"),
+    investigateAlert: (id, notes) => performAction(id, "investigate", { notes, statusHint: "investigating" }),
+    resolveAlert:     (id, notes) => performAction(id, "resolve", { notes, statusHint: "resolved" }),
+    assignAlert:      (id, assignedTo) => performAction(id, "assign", { assigned_to: assignedTo, statusHint: "assigned" }),
+    closeAlert:       (id) => performAction(id, "resolve", { statusHint: "resolved" }),
     refreshAlerts: fetchAlerts,
     refreshIncidents: fetchIncidents,
   };

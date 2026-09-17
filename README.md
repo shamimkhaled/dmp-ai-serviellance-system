@@ -24,6 +24,7 @@ On-premise surveillance and AI-assisted command platform: camera ingestion, real
 14. [Troubleshooting](#troubleshooting)
 15. [Production deployment notes](#production-deployment-notes)
 16. [Governance rules](#governance-rules)
+17. [Security](SECURITY.md)
 
 ---
 
@@ -74,8 +75,8 @@ flowchart LR
 1. **Cameras** push or are pulled into **MediaMTX** (RTSP hub).
 2. **video-ingest** registers camera paths in MediaMTX, health-checks streams, and exposes CRUD APIs for the dashboard.
 3. **traffic-ai** / **face-ai** read frames from MediaMTX, run inference, and publish alert candidates to **Redis Streams**.
-4. **alert-service** consumes streams, deduplicates, persists to **PostgreSQL**, and pushes live updates to the dashboard via **WebSocket**.
-5. Officers **Accept / Reject / Escalate** alerts in the dashboard; actions are written to the immutable **audit_log**.
+4. **alert-service** normalizes stream messages into **events**, evaluates **ai_rules** (severity lives only in rules), persists matching **alerts** to **PostgreSQL**, and pushes live updates to the dashboard via **WebSocket**. Failed Redis deliveries are reclaimed from the PEL and dead-lettered after a bounded retry.
+5. Officers **acknowledge / assign / investigate / resolve** (and still reject or escalate) alerts in the dashboard; actions and notes are written to the immutable **audit_log**.
 
 ---
 
@@ -131,19 +132,33 @@ First build can take **15–20 minutes** (traffic-ai installs CPU PyTorch + Open
 docker compose ps
 ```
 
-Wait until `pai_postgres`, `pai_redis`, and `pai_mediamtx` show `(healthy)`.
+Wait until `pai_redis` and `pai_mediamtx` show `(healthy)`. PostgreSQL is external — it is not a compose service.
 
 ### 4. Open the operator dashboard
 
+The UI is branded **VMS Intelligence**. Opening `http://localhost/` redirects to Keycloak (realm `vms`). Police GD/FIR drafting is under Administration → Industry pack.
+
+Lab users (password `changeme` — change after first login):
+
+| Username | Role |
+|----------|------|
+| `vms-admin` | admin |
+| `vms-operator` | operator |
+| `vms-investigator` | investigator |
+| `vms-viewer` | viewer |
+
 | URL | Purpose |
 |-----|---------|
-| http://localhost:3000 | **Dashboard** (main UI) |
-| http://localhost:8001/ | Video ingest API |
-| http://localhost:8002/preview | Traffic AI live detection grid |
-| http://localhost:8004/ | Alert service API |
-| http://localhost:8006/ | GD/FIR drafting API |
-| http://localhost:8080 | Keycloak (`admin` / `admin`) |
-| http://localhost:80 | Nginx reverse proxy |
+| http://localhost/ | **Dashboard** (nginx front door; OIDC login) |
+| http://localhost/ingest/health | Video ingest (via nginx; no JWT) |
+| http://localhost/api/health | Alert service (via nginx; no JWT) |
+| http://localhost/ai/health | Traffic AI (via nginx; no JWT) |
+| http://127.0.0.1:8080 | Keycloak admin (`KEYCLOAK_ADMIN`) and user login |
+| http://127.0.0.1:8889 | MediaMTX WHEP (browser ICE; not via nginx; no JWT) |
+
+Set `AUTH_MODE=off` in `.env` only for a trusted lab when Keycloak is unavailable. Recreate the dashboard container after changing `VITE_*` / `AUTH_MODE`.
+
+If the `vms` realm is missing, drop the `keycloak` database and recreate the container: `docker compose up -d --force-recreate keycloak`.
 
 ### 5. Verify the stack
 
@@ -152,10 +167,10 @@ Wait until `pai_postgres`, `pai_redis`, and `pai_mediamtx` show `(healthy)`.
 docker compose ps
 
 # Traffic AI processing frames
-curl -s http://localhost:8002/health | python3 -m json.tool
+curl -s http://127.0.0.1:8002/health | python3 -m json.tool
 
-# Alert service
-curl -s http://localhost:8004/health
+# Alert service (localhost bind)
+curl -s http://127.0.0.1:8004/health
 
 # MediaMTX paths (cam01 = fake test stream)
 curl -s http://localhost:9997/v3/paths/list | python3 -m json.tool
@@ -204,9 +219,11 @@ dmp-ai-serviellance-system/
 │       └── main.py             # GD/FIR LLM drafting (Ollama)
 └── dashboard/
     ├── src/
-    │   ├── App.jsx             # Main shell (tabs, sidebar, routing)
-    │   ├── components/index.jsx# AlertPanel, CameraGrid, IncidentList
-    │   └── hooks/index.js      # useAlerts, useWebSocket, useCameras
+    │   ├── App.jsx             # VMS Intelligence shell (Overview, Live, Alerts, …)
+    │   ├── lib/constants.js    # URLs, SEVERITY, ALERT_LABELS
+    │   ├── pages/              # Live, Events, Investigation, AdminHub
+    │   ├── components/index.jsx# CommandCenter, CameraGrid, AlertPanel, …
+    │   └── hooks/index.js      # useAlerts, useWebSocket
     ├── Dockerfile.dev          # Vite dev server in Docker
     └── package.json
 ```
@@ -215,24 +232,27 @@ dmp-ai-serviellance-system/
 
 ## Services and ports
 
-| Service | Container | Port | Description |
-|---------|-----------|------|-------------|
-| Dashboard | `pai_dashboard` | 3000 | React operator UI (Vite dev + hot reload) |
-| Video ingest | `pai_video_ingest` | 8001 | Camera registry, MediaMTX sync, RTSP test |
-| Traffic AI | `pai_traffic_ai` | 8002 | YOLO detection, violation analysis, AI preview |
-| Face AI | `pai_face_ai` | 8003 | Face watchlist matching (mock in dev) |
-| Alert service | `pai_alert_service` | 8004 | Alert pipeline + WebSocket |
-| Drafting | `pai_drafting` | 8006 | GD/FIR LLM drafting |
-| Keycloak | `pai_keycloak` | 8080 | RBAC (dev mode, in-memory DB) |
-| MediaMTX RTSP | `pai_mediamtx` | 8554 | Camera RTSP ingest |
-| MediaMTX WHEP | `pai_mediamtx` | 8889 | WebRTC live view (signaling) |
-| MediaMTX ICE | `pai_mediamtx` | 8189 | WebRTC media (UDP+TCP) |
-| MediaMTX HLS | `pai_mediamtx` | 8888 | HLS fallback player |
-| MediaMTX API | `pai_mediamtx` | 9997 | Path management REST API |
-| PostgreSQL | `pai_postgres` | 5432 | Primary database + audit log |
-| Redis | `pai_redis` | 6379 | Alert streams + pub/sub |
-| Nginx | `pai_nginx` | 80 | Reverse proxy |
-| Fake camera | `pai_fake_camera` | — | FFmpeg test pattern → `cam01` |
+Browser entry is **nginx on port 80**. Application APIs are bound to localhost on the host so they are not reachable from other machines. WHEP/ICE/HLS stay on MediaMTX because WebRTC ICE cannot go through an HTTP proxy.
+
+| Service | Container | Host bind | Description |
+|---------|-----------|-----------|-------------|
+| Nginx | `pai_nginx` | `0.0.0.0:80` | Dashboard + `/api` + `/ingest` + `/ai` + `/ws` |
+| Dashboard | `pai_dashboard` | `127.0.0.1:3000` | Vite (open via nginx) |
+| Video ingest | `pai_video_ingest` | `127.0.0.1:8001` | Camera registry (use `/ingest`) |
+| Traffic AI | `pai_traffic_ai` | `127.0.0.1:8002` | YOLO / detections (use `/ai`) |
+| Face AI | `pai_face_ai` | `127.0.0.1:8003` | Watchlist worker |
+| Alert service | `pai_alert_service` | `127.0.0.1:8004` | Alerts + WS (use `/api` and `/ws`) |
+| Drafting | `pai_drafting` | `127.0.0.1:8006` | GD/FIR (use `/api/draft`) |
+| Keycloak | `pai_keycloak` | `127.0.0.1:8080` | Realm `vms`, client `vms-dashboard` |
+| MediaMTX RTSP | `pai_mediamtx` | `0.0.0.0:8554` | Camera ingest — private network only |
+| MediaMTX WHEP | `pai_mediamtx` | `0.0.0.0:8889` | Browser live signaling |
+| MediaMTX ICE | `pai_mediamtx` | `0.0.0.0:8189` | WebRTC media (UDP+TCP) |
+| MediaMTX HLS | `pai_mediamtx` | `0.0.0.0:8888` | HLS fallback |
+| MediaMTX API | `pai_mediamtx` | not published | `http://mediamtx:9997` on compose network |
+| Redis | `pai_redis` | not published | `redis://redis:6379` on compose network |
+| PostgreSQL | external | your DB host | Apply `db/schema.sql` once |
+
+See [SECURITY.md](SECURITY.md) for exposure rules and secret handling.
 
 ---
 
@@ -244,12 +264,13 @@ Default values are set in `docker-compose.yml`. Override with a `.env` file in t
 
 | Variable | Default (compose) | Description |
 |----------|-------------------|-------------|
-| `DATABASE_URL` | `postgresql://policeai:policeai_dev_secret@postgres:5432/policeai` | PostgreSQL DSN |
-| `MEDIAMTX_URL` | `http://mediamtx:9997` | MediaMTX API base |
+| `DATABASE_URL` | from `.env` | PostgreSQL DSN (required) |
+| `MEDIAMTX_URL` | `http://mediamtx:9997` | MediaMTX API base (compose network) |
 | `RTSP_BASE_URL` | `rtsp://mediamtx:8554` | Internal RTSP relay |
 | `WHEP_BASE_URL` | `http://localhost:8889` | Browser WHEP base (host-facing) |
 | `HLS_BASE_URL` | `http://localhost:8888` | Browser HLS base |
 | `PUBLIC_RTSP_URL` | `rtsp://localhost:8554` | Publish URL shown to operators |
+| `EYENOR_CAM1_RTSP` | unset | Optional lab camera seed; never commit the value |
 
 ### traffic-ai (`traffic_ai_worker.py`)
 
@@ -263,10 +284,14 @@ Default values are set in `docker-compose.yml`. Override with a `.env` file in t
 | `USE_GPU` | `false` | `true` on GPU node (CUDA) |
 | `CAMERA_IDS` | `cam01` | Fallback if DB unavailable |
 | `TRAFFIC_CONF_THRESHOLD` | `0.35` | YOLO confidence cutoff |
-| `CAMERA_FPS` | `10` | Target decode FPS |
+| `CAMERA_FPS` | `10` | Default inference FPS when a camera has no `inference_fps` (1–25). Keep 10 on CPU; raise only when Administration shows GPU inference p95 under 50ms |
+| `DET_WS_COALESCE_MS` | `150` | Latest-wins detection overlay WS interval (0 = every inference frame) |
+| `BATCH_SIZE` | `4` on GPU, `1` on CPU | YOLO batch; RTSP/queue now share one infer loop so GPU batching actually runs |
 | `ANPR_ENABLED` | `false` | PaddleOCR plate reading (heavy) |
 | `PREVIEW_ENABLED` | `true` | Annotated MJPEG for `/preview` |
 | `LOG_LEVEL` | `INFO` | structlog level |
+| `AUTH_MODE` | `keycloak` | Verifies tokens via alert-service (no PyJWT in this image) |
+| `AUTH_VERIFY_URL` | `http://alert-service:8004/auth/verify` | Internal token check |
 
 ### face-ai
 
@@ -282,8 +307,13 @@ Default values are set in `docker-compose.yml`. Override with a `.env` file in t
 |----------|---------|-------------|
 | `DATABASE_URL` | (see above) | Alert persistence |
 | `REDIS_URL` | `redis://redis:6379` | Stream consumer |
-| `JWT_SECRET` | `dev_jwt_secret_change_in_prod` | Change in production |
-| `DEDUP_WINDOW_SECONDS` | `30` | Duplicate alert suppression |
+| `JWT_SECRET` | from `.env` | Legacy HS256 secret; APIs verify Keycloak RS256 JWTs |
+| `AUTH_MODE` | `keycloak` | `off` = lab admin bypass |
+| `OIDC_ISSUER` | `http://<HOST_IP>:8080/realms/vms` | Must match access-token `iss` (localhost and 127.0.0.1 both accepted) |
+| `OIDC_JWKS_URL` | `http://keycloak:8080/realms/vms/protocol/openid-connect/certs` | Internal JWKS |
+| `DEDUP_WINDOW_SECONDS` | `30` | Legacy env; alert creation cooldown is per-rule (`cooldown_seconds`) |
+| `PEL_MIN_IDLE_MS` | `60000` | Reclaim unacked Redis messages after this idle time |
+| `PEL_MAX_DELIVERIES` | `5` | After this many failed deliveries, move to `alerts:dead` |
 
 ### drafting
 
@@ -296,11 +326,15 @@ Default values are set in `docker-compose.yml`. Override with a `.env` file in t
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VITE_ALERT_SERVICE_URL` | `http://localhost:8004` | Alerts + WebSocket |
-| `VITE_VIDEO_INGEST_URL` | `http://localhost:8001` | Camera CRUD |
-| `VITE_MEDIAMTX_WHEP_URL` | `http://localhost:8889` | Live WHEP streams |
-| `VITE_MEDIAMTX_HLS_URL` | `http://localhost:8888` | HLS fallback |
-| `VITE_TRAFFIC_AI_URL` | `http://localhost:8002` | AI detection MJPEG |
+| `VITE_ALERT_SERVICE_URL` | `http://<HOST_IP>/api` | Alerts REST |
+| `VITE_WS_URL` | `ws://<HOST_IP>` | Origin for `/ws/{session}` |
+| `VITE_VIDEO_INGEST_URL` | `http://<HOST_IP>/ingest` | Camera CRUD |
+| `VITE_MEDIAMTX_WHEP_URL` | `http://<HOST_IP>:8889` | Live WHEP streams |
+| `VITE_MEDIAMTX_HLS_URL` | `http://<HOST_IP>:8888` | HLS fallback |
+| `VITE_TRAFFIC_AI_URL` | `http://<HOST_IP>/ai` | Detection overlay WS |
+| `VITE_AUTH_MODE` | `keycloak` | `off` skips OIDC redirect |
+| `VITE_OIDC_AUTHORITY` | `http://<HOST_IP>:8080/realms/vms` | Keycloak realm URL |
+| `VITE_OIDC_CLIENT_ID` | `vms-dashboard` | Public PKCE client |
 
 > **Note:** Changing `VITE_*` variables requires recreating the dashboard container:  
 > `docker compose up -d dashboard`
@@ -538,8 +572,28 @@ Standalone preview grid: http://localhost:8002/preview
 
 ### Violation alerts vs object detection
 
-- **Object detection** runs on every frame (visible in AI preview).
-- **Violation alerts** (red-light, stop-line, wrong-lane, speeding, parking) require rows in the `camera_zones` table. Without zones, only the motorcycle helmet heuristic can fire alerts.
+- **Object detection** runs at the camera's `inference_fps` (or `CAMERA_FPS` if unset). Display stays WHEP at the camera's native rate.
+- **Violation alerts** (red-light, stop-line, wrong-lane, speeding, parking, restricted-area) require rows in `camera_zones`. Without zones, only the motorcycle helmet heuristic can fire alerts. The helmet check is a brightness heuristic, not a trained classifier.
+- **Counting / line crossing / dwell** use DeepSORT `track_id`. A `counting_line` zone increments enter/exit once per track crossing (same `track_id` is not double-counted on a single crossing). Dwell is milliseconds inside a polygon, exposed on the detection overlay.
+
+### Zone API (video-ingest)
+
+Coordinates are normalised 0–1 relative to the inference frame.
+
+```bash
+# List / create / update / soft-delete
+curl http://localhost/ingest/cameras/cam01/zones
+curl -X POST http://localhost/ingest/cameras/cam01/zones \
+  -H 'Content-Type: application/json' \
+  -d '{"zone_type":"restricted","zone_name":"server room","polygon_points":[[0.1,0.1],[0.9,0.1],[0.9,0.9],[0.1,0.9]]}'
+curl -X POST http://localhost/ingest/cameras/cam01/zones \
+  -H 'Content-Type: application/json' \
+  -d '{"zone_type":"counting_line","zone_name":"lobby door","line_points":[[0.2,0.5],[0.8,0.5]],"camera_direction":"down"}'
+```
+
+`camera_direction` `down` treats the positive side of the line as entry; `up` reverses that. Traffic-ai reloads zones on `ZONE_REFRESH_INTERVAL`.
+
+Live counts: `GET /ai/counts/{camera_id}` (also on the detection WebSocket as `counts`).
 
 ### Health and metrics
 
@@ -581,7 +635,13 @@ The dashboard connects automatically and receives `new_alert`, `alert_updated`, 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/alerts?limit=100` | List alerts |
-| POST | `/alerts/{id}/action` | Accept / reject / escalate |
+| GET | `/alerts/{id}` | Alert detail + notes + snapshot |
+| POST | `/alerts/{id}/action` | `acknowledge` / `assign` / `investigate` / `resolve` / `note` (legacy aliases: accepted, rejected, escalated, closed) |
+| POST | `/alerts/{id}/notes` | Add an investigation note |
+| GET | `/events` | Normalized events (no snapshots) |
+| GET/POST | `/rules` | List / create AI rules (severity is defined here) |
+| PATCH/DELETE | `/rules/{id}` | Update or disable a rule |
+| GET | `/dead-letters` | Redis processing failures |
 | GET | `/incidents?limit=50` | Incident cards |
 | GET | `/health` | Service health |
 
@@ -603,7 +663,7 @@ postgresql://policeai:policeai_dev_secret@localhost:5432/policeai
 
 Applied automatically on first `postgres` container start from `db/schema.sql`.
 
-Key tables: `cameras`, `alerts`, `incidents`, `watchlist`, `watchlist_faces`, `audit_log`, `drafts`, `officers`
+Key tables: `cameras`, `events`, `ai_rules`, `alerts`, `alert_notes`, `incidents`, `watchlist`, `audit_log`, `drafts`, `officers`
 
 ### Migrations
 
@@ -642,7 +702,7 @@ docker exec pai_postgres psql -U policeai -d policeai \
 2. Publish to Redis stream `alerts:your_type`.
 3. Add stream to `ALERT_STREAMS` in `services/alert-service/main.py`.
 4. Add service to `docker-compose.yml`.
-5. Add alert type labels in `dashboard/src/components/index.jsx` (`ALERT_LABELS`).
+5. Add alert type labels in `dashboard/src/lib/constants.js` (`ALERT_LABELS`).
 
 ### Rebuild entire stack
 

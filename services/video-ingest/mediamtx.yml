@@ -6,7 +6,7 @@
 #
 # Key differences from production:
 #   rtspAddress: :8554     (all interfaces — no VLAN isolation in Docker)
-#   apiAddress:  :9997     (exposed so host health-checks work)
+#   apiAddress:  :9997     (compose network only — not published to the host)
 #   record: false          (no NFS archive in local dev)
 #   authMethod: internal   (allow any — no credential enforcement)
 ################################################################################
@@ -50,6 +50,7 @@ hls:                 true
 hlsAddress:          :8888
 hlsAllowOrigins:     ["*"]
 hlsAlwaysRemux:      true
+# MediaMTX Low-Latency HLS requires ≥ 7 segments or the muxer crashes.
 hlsSegmentCount:     7
 hlsSegmentDuration:  1s
 
@@ -57,8 +58,7 @@ hlsSegmentDuration:  1s
 # 5. API
 ###############################################################################
 api:        true
-# Exposed on all interfaces in Docker so health-check probes reach it.
-# In production this is 127.0.0.1:9997 only (infra/mediamtx/mediamtx.yml).
+# Reachable on the compose network for video-ingest. Not published to the host.
 apiAddress: :9997
 
 ###############################################################################
@@ -89,11 +89,8 @@ pathDefaults:
 ###############################################################################
 paths:
 
-  # Eyenor IP camera — always-on pull (not matched by cam[0-9]+ regex).
-  eyenor_cam1:
-    source:          rtsp://admin:123456@172.19.1.3:554/h264/ch1/main/av_stream
-    sourceOnDemand:  false
-    rtspTransport:   tcp
+  # Camera paths (including eyenor_cam1) are registered at runtime by
+  # video-ingest from the cameras table. Do not put RTSP userinfo here.
 
   # Catch-all for cameras registered dynamically by the ingest service.
   "~^cam[0-9]+$":

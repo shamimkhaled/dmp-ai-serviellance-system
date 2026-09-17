@@ -3,13 +3,38 @@
 # Run: docker compose up -d
 # No GPU required for CPU inference (set USE_GPU=true on GPU nodes)
 #
-# Requires DATABASE_URL pointing at an external PostgreSQL server with
-# pgvector installed (see .env.example + DEPLOYMENT.md). Apply db/schema.sql
-# to that database once before first start — it is no longer auto-applied
-# by a bundled postgres container.
+# Requires PostgreSQL + pgvector. Default: bundled `postgres` service
+# (pai_postgres). Override DATABASE_URL in `.env` to use an external DB.
 # ─────────────────────────────────────────────
 
 services:
+
+  # ── PostgreSQL + pgvector (local VMS database) ──
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: pai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: policeai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-policeai_dev_secret}
+      POSTGRES_DB: policeai
+    ports:
+      # 5432 is taken by archive-postgres on this host.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init/00_keycloak.sql:/docker-entrypoint-initdb.d/00_keycloak.sql:ro
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/migrations/002_camera_brands.sql:/docker-entrypoint-initdb.d/02_camera_brands.sql:ro
+      - ./db/migrations/004_camera_status_zones.sql:/docker-entrypoint-initdb.d/04_camera_status_zones.sql:ro
+      - ./db/migrations/005_inference_fps_zone_types.sql:/docker-entrypoint-initdb.d/05_inference_fps_zone_types.sql:ro
+      - ./db/migrations/006_events_ai_rules.sql:/docker-entrypoint-initdb.d/06_events_ai_rules.sql:ro
+      - ./db/migrations/007_auth_tenancy.sql:/docker-entrypoint-initdb.d/07_auth_tenancy.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U policeai -d policeai"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
   # ── Redis Streams (alert queue + pub/sub) ──
   redis:
@@ -35,16 +60,17 @@ services:
     container_name: pai_mediamtx
     restart: unless-stopped
     ports:
-      - "8554:8554"       # RTSP
-      - "8889:8889"       # WebRTC/WHEP signaling (HTTP)
+      # RTSP: camera network / publish-mode devices only. Do not expose to the Internet.
+      - "8554:8554"
+      - "8889:8889"       # WebRTC/WHEP signaling (browser; ICE cannot go through nginx)
       - "8189:8189/udp"   # WebRTC ICE (media) — required or browser ICE fails
       - "8189:8189/tcp"   # WebRTC ICE fallback (restrictive networks)
-      - "8888:8888"       # HLS
-      - "9997:9997"       # API
+      - "8888:8888"       # HLS fallback
+      # MediaMTX API (9997) is internal — video-ingest reaches it on the compose network.
     environment:
       # Overrides webrtcAdditionalHosts from mediamtx.yml — must be the IP/hostname
       # browsers use to reach this server, or WebRTC/WHEP ICE negotiation fails.
-      MTX_WEBRTCADDITIONALHOSTS: ${HOST_IP:-127.0.0.1}
+      MTX_WEBRTCADDITIONALHOSTS: 127.0.0.1,localhost,${HOST_IP:-127.0.0.1}
     volumes:
       - ./services/video-ingest/mediamtx.yml:/mediamtx.yml
     healthcheck:
@@ -64,6 +90,8 @@ services:
     depends_on:
       mediamtx:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_URL}
       MEDIAMTX_URL: http://mediamtx:9997
@@ -71,10 +99,16 @@ services:
       WHEP_BASE_URL: http://${HOST_IP:-localhost}:8889
       HLS_BASE_URL: http://${HOST_IP:-localhost}:8888
       PUBLIC_RTSP_URL: rtsp://${HOST_IP:-localhost}:8554
+      EYENOR_CAM1_RTSP: ${EYENOR_CAM1_RTSP:-}
+      AUTH_MODE: ${AUTH_MODE:-keycloak}
+      OIDC_ISSUER: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}/realms/vms
+      OIDC_JWKS_URL: http://keycloak:8080/realms/vms/protocol/openid-connect/certs
+      OIDC_CLIENT_ID: vms-dashboard
+      CORS_ORIGINS: http://${HOST_IP:-localhost},http://${HOST_IP:-localhost}:3000,http://localhost,http://localhost:3000,http://127.0.0.1,http://127.0.0.1:3000
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
 
   # ── Traffic AI worker (YOLO) ──
   traffic-ai:
@@ -89,6 +123,10 @@ services:
         condition: service_healthy
       video-ingest:
         condition: service_started
+      alert-service:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379
       DATABASE_URL: ${DATABASE_URL}
@@ -98,12 +136,15 @@ services:
       USE_GPU: "false"            # set "true" on GPU nodes (A100 + CUDA 12)
       TRAFFIC_CONF_THRESHOLD: "0.35"
       CAMERA_FPS: "10"
+      DET_WS_COALESCE_MS: "150"
       LOG_LEVEL: "INFO"
       ANPR_ENABLED: "false"       # plate OCR (PaddleOCR) — heavy; enable on GPU nodes
+      AUTH_MODE: ${AUTH_MODE:-keycloak}
+      AUTH_VERIFY_URL: http://alert-service:8004/auth/verify
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8002:8002"
+      - "127.0.0.1:8002:8002"
 
   # ── Face recognition worker (InsightFace) ──
   face-ai:
@@ -114,17 +155,21 @@ services:
     container_name: pai_face_ai
     restart: unless-stopped
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379
       DATABASE_URL: ${DATABASE_URL}
       RTSP_BASE_URL: rtsp://mediamtx:8554
-      MOCK_MODE: "false"
+      MOCK_MODE: ${FACE_AI_MOCK_MODE:-true}
       FACE_MATCH_THRESHOLD: "0.75"
+      FACE_PRIVACY: ${FACE_PRIVACY:-true}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8003:8003"
+      - "127.0.0.1:8003:8003"
 
   # ── Alert service (Redis → PostgreSQL → WebSocket) ──
   alert-service:
@@ -137,15 +182,24 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      keycloak:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: redis://redis:6379
-      JWT_SECRET: dev_jwt_secret_change_in_prod
+      JWT_SECRET: ${JWT_SECRET:-change-me-generate-a-long-random-string}
       DEDUP_WINDOW_SECONDS: "30"
+      AUTH_MODE: ${AUTH_MODE:-keycloak}
+      OIDC_ISSUER: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}/realms/vms
+      OIDC_JWKS_URL: http://keycloak:8080/realms/vms/protocol/openid-connect/certs
+      OIDC_CLIENT_ID: vms-dashboard
+      CORS_ORIGINS: http://${HOST_IP:-localhost},http://${HOST_IP:-localhost}:3000,http://localhost,http://localhost:3000,http://127.0.0.1,http://127.0.0.1:3000
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8004:8004"
+      - "127.0.0.1:8004:8004"
 
   # ── GD/FIR drafting service ──
   drafting:
@@ -155,27 +209,47 @@ services:
       network: host
     container_name: pai_drafting
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_URL}
       LLM_API_URL: http://host.docker.internal:11434
       LLM_MODEL: llama3.1:8b
+      AUTH_MODE: ${AUTH_MODE:-keycloak}
+      OIDC_ISSUER: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}/realms/vms
+      OIDC_JWKS_URL: http://keycloak:8080/realms/vms/protocol/openid-connect/certs
+      OIDC_CLIENT_ID: vms-dashboard
+      CORS_ORIGINS: http://${HOST_IP:-localhost},http://${HOST_IP:-localhost}:3000,http://localhost,http://localhost:3000,http://127.0.0.1,http://127.0.0.1:3000
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8006:8006"
+      - "127.0.0.1:8006:8006"
 
   # ── Keycloak (RBAC auth) ──
   keycloak:
     image: quay.io/keycloak/keycloak:24.0
     container_name: pai_keycloak
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
-      KC_DB: dev-mem
-    command: start-dev
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-change-me}
+      # dev-mem H2 is empty on some connections (login 400 / USER_ENTITY missing).
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: policeai
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-policeai_dev_secret}
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+    command: start-dev --import-realm
+    volumes:
+      - ./infra/keycloak/vms-realm.json:/opt/keycloak/data/import/vms-realm.json:ro
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
   # ── React dashboard (frontend dev server) ──
   dashboard:
@@ -188,15 +262,21 @@ services:
     depends_on:
       - alert-service
     environment:
-      VITE_ALERT_SERVICE_URL: http://${HOST_IP:-localhost}:8004
-      VITE_VIDEO_INGEST_URL: http://${HOST_IP:-localhost}:8001
+      VITE_ALERT_SERVICE_URL: http://${HOST_IP:-localhost}/api
+      VITE_WS_URL: ws://${HOST_IP:-localhost}
+      VITE_VIDEO_INGEST_URL: http://${HOST_IP:-localhost}/ingest
       VITE_MEDIAMTX_WHEP_URL: http://${HOST_IP:-localhost}:8889
       VITE_MEDIAMTX_HLS_URL: http://${HOST_IP:-localhost}:8888
-      VITE_TRAFFIC_AI_URL: http://${HOST_IP:-localhost}:8002
+      VITE_TRAFFIC_AI_URL: http://${HOST_IP:-localhost}/ai
+      VITE_AUTH_MODE: ${AUTH_MODE:-keycloak}
+      VITE_OIDC_AUTHORITY: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}/realms/vms
+      VITE_OIDC_CLIENT_ID: vms-dashboard
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
-      - ./dashboard/src:/app/src   # hot reload
+      - ./dashboard/src:/app/src
+      - ./dashboard/index.html:/app/index.html:ro
+      - ./dashboard/vite.config.js:/app/vite.config.js:ro
 
   # ── Nginx reverse proxy ──
   nginx:
@@ -208,6 +288,8 @@ services:
       - drafting
       - dashboard
       - mediamtx
+      - video-ingest
+      - traffic-ai
     ports:
       - "80:80"
     volumes:
@@ -215,6 +297,7 @@ services:
 
 volumes:
   redis_data:
+  postgres_data:
 
 # Pin the compose network away from 172.19.0.0/16 so the Eyenor camera at
 # 172.19.1.3 is reachable from MediaMTX (Docker otherwise often claims 172.19).

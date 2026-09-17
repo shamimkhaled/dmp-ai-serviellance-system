@@ -1,10 +1,24 @@
 """MediaMTX v3 API client — register camera paths dynamically."""
 
 import logging
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 log = logging.getLogger("video-ingest.mediamtx")
+
+
+def _redact_source(source: str) -> str:
+    if source == "publisher" or "://" not in source:
+        return source
+    parts = urlsplit(source)
+    if not parts.username and not parts.password:
+        return source
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    netloc = host
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 async def ensure_path(
@@ -27,7 +41,7 @@ async def ensure_path(
             json=payload,
         )
         if patch.status_code in (200, 201):
-            log.info(f"MediaMTX path updated: {path_name} → {source}")
+            log.info(f"MediaMTX path updated: {path_name} → {_redact_source(source)}")
             return
 
         add = await client.post(
@@ -35,7 +49,7 @@ async def ensure_path(
             json=payload,
         )
         if add.status_code in (200, 201):
-            log.info(f"MediaMTX path added: {path_name} → {source}")
+            log.info(f"MediaMTX path added: {path_name} → {_redact_source(source)}")
             return
 
         if "already exists" in (add.text or ""):
