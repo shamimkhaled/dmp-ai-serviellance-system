@@ -1,0 +1,110 @@
+{
+  "realm": "vms",
+  "enabled": true,
+  "displayName": "VMS Intelligence",
+  "loginTheme": "keycloak.v2",
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "roles": {
+    "realm": [
+      { "name": "admin", "description": "Full administration" },
+      { "name": "operator", "description": "Live ops and alert actions" },
+      { "name": "investigator", "description": "Cases, evidence, drafting" },
+      { "name": "viewer", "description": "Read-only monitoring" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "vms-dashboard",
+      "name": "VMS Intelligence dashboard",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "redirectUris": [
+        "http://localhost/*",
+        "http://127.0.0.1/*",
+        "http://localhost:3000/*",
+        "http://127.0.0.1:3000/*",
+        "http://localhost:80/*",
+        "http://127.0.0.1:80/*"
+      ],
+      "webOrigins": ["+"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": ["profile", "email"],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "userinfo.token.claim": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "roles",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    }
+  ],
+  "groups": [
+    { "name": "vms-admins", "realmRoles": ["admin"] },
+    { "name": "vms-operators", "realmRoles": ["operator"] },
+    { "name": "vms-investigators", "realmRoles": ["investigator"] },
+    { "name": "vms-viewers", "realmRoles": ["viewer"] }
+  ],
+  "users": [
+    {
+      "username": "vms-admin",
+      "enabled": true,
+      "email": "vms-admin@local",
+      "emailVerified": true,
+      "firstName": "VMS",
+      "lastName": "Admin",
+      "credentials": [{ "type": "password", "value": "changeme", "temporary": false }],
+      "groups": ["/vms-admins"],
+      "realmRoles": ["admin"]
+    },
+    {
+      "username": "vms-operator",
+      "enabled": true,
+      "email": "vms-operator@local",
+      "emailVerified": true,
+      "firstName": "VMS",
+      "lastName": "Operator",
+      "credentials": [{ "type": "password", "value": "changeme", "temporary": false }],
+      "groups": ["/vms-operators"],
+      "realmRoles": ["operator"]
+    },
+    {
+      "username": "vms-investigator",
+      "enabled": true,
+      "email": "vms-investigator@local",
+      "emailVerified": true,
+      "firstName": "VMS",
+      "lastName": "Investigator",
+      "credentials": [{ "type": "password", "value": "changeme", "temporary": false }],
+      "groups": ["/vms-investigators"],
+      "realmRoles": ["investigator"]
+    },
+    {
+      "username": "vms-viewer",
+      "enabled": true,
+      "email": "vms-viewer@local",
+      "emailVerified": true,
+      "firstName": "VMS",
+      "lastName": "Viewer",
+      "credentials": [{ "type": "password", "value": "changeme", "temporary": false }],
+      "groups": ["/vms-viewers"],
+      "realmRoles": ["viewer"]
+    }
+  ]
+}

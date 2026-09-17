@@ -1,6 +1,4 @@
 # ── Environment & secrets ─────────────────────────────────────
-.env
-.env.*
 !.env.example
 *.pem
 *.key
@@ -85,7 +83,6 @@ docker-compose.override.yml
 docker-compose.*.local.yml
 
 # ── IDE / editors ─────────────────────────────────────────────
-.vscode/
 !.vscode/extensions.json
 !.vscode/settings.json.example
 .idea/
@@ -136,3 +133,4 @@ backups/
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 graft/
+config.bat

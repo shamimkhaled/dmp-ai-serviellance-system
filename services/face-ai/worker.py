@@ -152,6 +152,7 @@ async def publish_face_alert(redis: aioredis.Redis, camera_id: str,
         "severity":        str(risk_to_severity.get(match["risk_category"], 2)),
         "snapshot_b64":    snapshot_b64,
         "object_metadata": json.dumps({
+            "object_type":      "person",
             "matched_name":     match["name"],
             "risk_category":    match["risk_category"],
             "watchlist_id":     match["watchlist_id"],
@@ -163,7 +164,7 @@ async def publish_face_alert(redis: aioredis.Redis, camera_id: str,
     }
     msg_id = await redis.xadd(REDIS_STREAM, payload, maxlen=5000)
     log.info(f"Face match alert → {REDIS_STREAM} [{msg_id}]: "
-             f"{match['name']} ({match['risk_category']}) "
+             f"watchlist={match.get('watchlist_id')} "
              f"sim={match['similarity']:.3f} on {camera_id}")
     _stats["watchlist_matches"] += 1
 
