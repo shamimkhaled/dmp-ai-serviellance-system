@@ -18,9 +18,11 @@ import uuid
 from datetime import datetime, timezone
 
 import asyncpg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from auth import cors_kwargs, ensure_auth_schema, install_auth, principal_of, require_perm, upsert_officer
 
 log = logging.getLogger("drafting")
 logging.basicConfig(level=logging.INFO)
@@ -29,9 +31,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://policeai:policeai_dev_sec
 LLM_API_URL  = os.getenv("LLM_API_URL", "http://localhost:11434")   # Ollama local LLM
 LLM_MODEL    = os.getenv("LLM_MODEL",   "llama3.1:8b")              # or gemma3, mistral
 
-app = FastAPI(title="Police AI – GD/FIR Drafting Service")
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="VMS Intelligence – GD/FIR Drafting")
+app.add_middleware(CORSMiddleware, **cors_kwargs())
+install_auth(app)
 
 pool: asyncpg.Pool | None = None
 
@@ -40,6 +42,7 @@ pool: asyncpg.Pool | None = None
 async def startup():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    await ensure_auth_schema(pool)
 
 
 # ── GD required fields (Bangladesh Police format) ────
@@ -192,11 +195,15 @@ async def health():
 
 
 @app.post("/draft")
-async def create_draft(req: DraftRequest):
+async def create_draft(request: Request, req: DraftRequest):
     """
     Main endpoint: convert officer notes → structured draft.
     Returns draft for officer review — NOT yet saved as approved.
     """
+    require_perm(principal_of(request), "draft:write")
+    actor = await upsert_officer(pool, principal_of(request))
+    if actor:
+        req.officer_id = actor
     if req.draft_type not in ("GD", "FIR"):
         raise HTTPException(400, "draft_type must be GD or FIR")
 
@@ -270,12 +277,16 @@ Convert these notes into a structured {req.draft_type} entry.
 
 
 @app.post("/draft/{draft_id}/approve")
-async def approve_draft(draft_id: str, body: DraftApproval):
+async def approve_draft(request: Request, draft_id: str, body: DraftApproval):
     """
     Officer approves (or rejects) a draft.
     This is the mandatory human-in-the-loop gate.
     Approved drafts are locked — no further AI modification.
     """
+    require_perm(principal_of(request), "draft:write")
+    actor = await upsert_officer(pool, principal_of(request))
+    if actor:
+        body.officer_id = actor
     draft = await pool.fetchrow(
         "SELECT * FROM drafts WHERE id=$1", uuid.UUID(draft_id)
     )

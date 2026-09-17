@@ -3,3 +3,4 @@ uvicorn[standard]
 asyncpg
 httpx
 pydantic>=2
+PyJWT[crypto]>=2.8.0

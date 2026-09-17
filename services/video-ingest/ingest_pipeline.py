@@ -490,7 +490,7 @@ class WebRTCRelay:
                 timeout=5.0,
             )
             if resp.status_code in (200, 201):
-                log.info("mediamtx_path_registered", camera_id=camera.camera_id, source=source)
+                log.info("mediamtx_path_registered", camera_id=camera.camera_id)
                 return True
             if resp.status_code == 400 and "already" in resp.text.lower():
                 return True  # path already exists — fine

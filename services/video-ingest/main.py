@@ -46,6 +46,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncGenerator
+from uuid import UUID
 
 import asyncpg
 import cv2
@@ -59,6 +60,10 @@ from pydantic import BaseModel, Field
 
 from camera_urls import BRAND_TEMPLATES, build_rtsp_url, list_brands
 from mediamtx_client import ensure_path, get_path, list_paths, remove_path
+from auth import (
+    allowed_camera_ids, cors_kwargs, ensure_auth_schema, install_auth,
+    principal_of, require_perm,
+)
 from transcode_manager import (
     ensure_h264_relay,
     stop_h264_relay,
@@ -139,10 +144,57 @@ async def _migrate(pg: asyncpg.Pool) -> None:
         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS port INT DEFAULT 554",
         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS username VARCHAR(100)",
         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS channel INT DEFAULT 1",
+        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS inference_fps INTEGER",
     ]
     for sql in stmts:
         await pg.execute(sql)
+    await pg.execute(
+        """
+        DO $$ BEGIN
+          ALTER TABLE cameras ADD CONSTRAINT cameras_inference_fps_range
+            CHECK (inference_fps IS NULL OR (inference_fps >= 1 AND inference_fps <= 25));
+        EXCEPTION
+          WHEN duplicate_object THEN NULL;
+        END $$
+        """
+    )
     log.info("db_migrations_applied")
+    await ensure_auth_schema(pg)
+    try:
+        await pg.execute(
+            """
+            DO $$
+            DECLARE
+              r RECORD;
+            BEGIN
+              FOR r IN
+                SELECT c.conname
+                FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE t.relname = 'camera_zones'
+                  AND n.nspname = 'public'
+                  AND c.contype = 'c'
+                  AND pg_get_constraintdef(c.oid) ILIKE '%zone_type%'
+              LOOP
+                EXECUTE format('ALTER TABLE camera_zones DROP CONSTRAINT %I', r.conname);
+              END LOOP;
+            END $$
+            """
+        )
+        await pg.execute(
+            """
+            ALTER TABLE camera_zones ADD CONSTRAINT camera_zones_zone_type_check
+              CHECK (zone_type IN (
+                'red_light','stop_line','wrong_lane','no_parking','speed','detection',
+                'restricted','counting_line'
+              ))
+            """
+        )
+    except asyncpg.UndefinedTableError:
+        log.info("camera_zones_missing_skip_type_check")
+    except Exception as exc:
+        log.warning("zone_type_constraint_apply_failed", error=str(exc))
     await _seed_builtin_cameras(pg)
 
 
@@ -151,10 +203,11 @@ async def _seed_builtin_cameras(pg: asyncpg.Pool) -> None:
 
     Insert-only: later dashboard edits are not overwritten on restart.
     """
-    eyenor_rtsp = os.getenv(
-        "EYENOR_CAM1_RTSP",
-        "rtsp://admin:123456@172.19.1.3:554/h264/ch1/main/av_stream",
-    )
+    eyenor_rtsp = os.getenv("EYENOR_CAM1_RTSP", "").strip()
+    if not eyenor_rtsp:
+        return
+    from urllib.parse import urlparse as _parse
+    parsed = _parse(eyenor_rtsp)
     result = await pg.execute(
         """INSERT INTO cameras
            (camera_id, name, rtsp_url, brand, connection_mode, host, port,
@@ -166,9 +219,9 @@ async def _seed_builtin_cameras(pg: asyncpg.Pool) -> None:
         eyenor_rtsp,
         "eyenor",
         "pull",
-        "172.19.1.3",
-        554,
-        "admin",
+        parsed.hostname or "",
+        parsed.port or 554,
+        parsed.username or "",
         1,
         "Eyenor Cam 1",
         "facility",
@@ -249,10 +302,13 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    **cors_kwargs(),
 )
+install_auth(app)
+
+
+def _user(request: Request):
+    return principal_of(request)
 
 
 @app.exception_handler(RuntimeError)
@@ -283,6 +339,7 @@ class CameraConnect(BaseModel):
     zone_type: str = "entry_exit"
     latitude: float | None = None
     longitude: float | None = None
+    inference_fps: int | None = None
 
 
 class CameraUpdate(BaseModel):
@@ -299,9 +356,53 @@ class CameraUpdate(BaseModel):
     zone_type: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+    inference_fps: int | None = None
+
+
+ZONE_TYPES = frozenset({
+    "red_light", "stop_line", "wrong_lane", "no_parking", "speed",
+    "detection", "restricted", "counting_line",
+})
+POLYGON_ZONE_TYPES = frozenset({
+    "red_light", "no_parking", "speed", "detection", "restricted",
+})
+LINE_ZONE_TYPES = frozenset({"wrong_lane", "counting_line"})
+
+
+class ZoneCreate(BaseModel):
+    zone_type: str
+    zone_name: str | None = None
+    polygon_points: list[list[float]] | None = None
+    line_points: list[list[float]] | None = None
+    stop_line_y: float | None = Field(default=None, ge=0, le=1)
+    speed_limit_kmh: int | None = Field(default=60, ge=1, le=300)
+    speed_cal_ppm: float | None = Field(default=100.0, gt=0)
+    camera_direction: str = "down"
+    is_active: bool = True
+
+
+class ZoneUpdate(BaseModel):
+    zone_type: str | None = None
+    zone_name: str | None = None
+    polygon_points: list[list[float]] | None = None
+    line_points: list[list[float]] | None = None
+    stop_line_y: float | None = Field(default=None, ge=0, le=1)
+    speed_limit_kmh: int | None = Field(default=None, ge=1, le=300)
+    speed_cal_ppm: float | None = Field(default=None, gt=0)
+    camera_direction: str | None = None
+    is_active: bool | None = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+def _clamp_inference_fps(value: int | None) -> int | None:
+    if value is None:
+        return None
+    v = int(value)
+    if v <= 0:
+        return None
+    return max(1, min(25, v))
+
+
 def _validate_rtsp_url(url: str) -> None:
     from urllib.parse import urlparse as _parse
 
@@ -317,10 +418,25 @@ def _validate_rtsp_url(url: str) -> None:
         )
 
 
+def _publicize_camera(cam: dict) -> dict:
+    """Strip RTSP credentials before any payload leaves this process."""
+    cam.pop("rtsp_url", None)
+    user = cam.pop("username", None) or ""
+    cam["has_credentials"] = bool(user)
+    cam["username"] = ""
+    fps = cam.get("inference_fps")
+    if fps is not None:
+        cam["inference_fps"] = int(fps)
+    return cam
+
+
 def _camera_row_to_dict(row: asyncpg.Record) -> dict:
     cam = dict(row)
     if cam.get("last_seen_at"):
         cam["last_seen_at"] = cam["last_seen_at"].isoformat()
+    for key in ("site_id", "tenant_id"):
+        if cam.get(key) is not None:
+            cam[key] = str(cam[key])
     cam["publish_url"] = (
         f"{PUBLIC_RTSP}/{cam['camera_id']}"
         if cam.get("connection_mode") == "publish"
@@ -335,7 +451,9 @@ def _apply_playback_urls(cam: dict, playback_id: str) -> None:
     cam["hls_url"] = f"{HLS_BASE_URL}/{playback_id}/index.m3u8"
 
 
-async def _enrich_camera_status(cam: dict, path: dict | None) -> dict:
+async def _enrich_camera_status(
+    cam: dict, path: dict | None, path_map: dict | None = None
+) -> dict:
     """Derive stream_status, status_message, and playback URLs from MediaMTX path state."""
     cid = cam["camera_id"]
     mode = cam.get("connection_mode") or "pull"
@@ -353,7 +471,9 @@ async def _enrich_camera_status(cam: dict, path: dict | None) -> dict:
         cam["stream_status"] = "live"
         if video_codec == "H265":
             view = view_path_id(cid)
-            view_path = await get_path(MEDIAMTX_URL, view)
+            view_path = (path_map or {}).get(view)
+            if view_path is None:
+                view_path = await get_path(MEDIAMTX_URL, view)
             if view_path and view_path.get("ready"):
                 playback_id = view
                 cam["webrtc_compatible"] = True
@@ -687,6 +807,7 @@ async def root() -> dict:
             "delete":   "DELETE /cameras/{camera_id}",
             "test":     "POST /cameras/{camera_id}/test",
             "snapshot": "GET /cameras/{camera_id}/snapshot",
+            "zones":    "/cameras/{camera_id}/zones",
             "health":   "/health",
         },
         "whep_base": WHEP_BASE_URL,
@@ -713,50 +834,81 @@ async def health() -> dict:
             for cid, st in _pipeline_state.items()
         }
 
+    resources: dict = {"cpu_count": os.cpu_count(), "load1": None, "rss_mb": None}
+    try:
+        resources["load1"] = round(os.getloadavg()[0], 2)
+    except Exception:
+        pass
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as fh:
+            pages = int(fh.read().split()[1])
+        resources["rss_mb"] = round(pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024), 1)
+    except Exception:
+        pass
+
     return {
         "status":         "ok",
         "service":        "video-ingest",
         "active_streams": len(active),
         "live_cameras":   sorted(active),
         "pipeline":       pipeline,
+        "perf": {
+            "camera_count": len(active),
+            "resources": resources,
+        },
     }
 
 
 # ── Routes: camera brands ──────────────────────────────────────────────────────
 @app.get("/cameras/brands")
-async def camera_brands() -> dict:
+async def camera_brands(request: Request) -> dict:
+    require_perm(_user(request), "cameras:read")
     return {"brands": list_brands()}
 
 
 # ── Routes: camera CRUD ────────────────────────────────────────────────────────
 @app.get("/cameras")
-async def list_cameras() -> list[dict]:
+async def list_cameras(request: Request) -> list[dict]:
+    require_perm(_user(request), "cameras:read")
     rows = await pool.fetch(
         """SELECT camera_id, name, brand, connection_mode, location_name,
-                  zone_type, last_seen_at, active, host, port, channel, username
+                  zone_type, last_seen_at, active, host, port, channel, username,
+                  inference_fps, site_id, tenant_id
            FROM cameras WHERE active = TRUE ORDER BY camera_id"""
     )
+    allowed = await allowed_camera_ids(pool, _user(request))
+    try:
+        path_map = {p["name"]: p for p in await list_paths(MEDIAMTX_URL)}
+    except Exception:
+        path_map = {}
     cameras: list[dict] = []
     for r in rows:
+        if allowed is not None and r["camera_id"] not in allowed:
+            continue
         cam = _camera_row_to_dict(r)
-        path = await get_path(MEDIAMTX_URL, cam["camera_id"])
-        cameras.append(await _enrich_camera_status(cam, path))
+        path = path_map.get(cam["camera_id"])
+        cameras.append(
+            _publicize_camera(await _enrich_camera_status(cam, path, path_map))
+        )
     return cameras
 
 
 @app.get("/cameras/{camera_id}")
-async def get_camera(camera_id: str) -> dict:
+async def get_camera(request: Request, camera_id: str) -> dict:
+    require_perm(_user(request), "cameras:read")
+    allowed = await allowed_camera_ids(pool, _user(request))
+    if allowed is not None and camera_id not in allowed:
+        raise HTTPException(404, "Camera not found")
     row = await pool.fetchrow(
         """SELECT camera_id, name, brand, connection_mode, location_name,
                   zone_type, last_seen_at, active, host, port, channel,
-                  username, rtsp_url, latitude, longitude
+                  username, rtsp_url, latitude, longitude, inference_fps
            FROM cameras WHERE camera_id=$1 AND active=TRUE""",
         camera_id,
     )
     if not row:
         raise HTTPException(404, "Camera not found")
     cam = _camera_row_to_dict(row)
-    cam["rtsp_url"] = row["rtsp_url"] if cam.get("brand") == "custom" else ""
     path = await get_path(MEDIAMTX_URL, camera_id)
     cam = await _enrich_camera_status(cam, path)
     if (
@@ -767,16 +919,17 @@ async def get_camera(camera_id: str) -> dict:
         probe = await _probe_rtsp(row["rtsp_url"], camera_id)
         if probe:
             cam["status_message"] = probe
-    return cam
+    return _publicize_camera(cam)
 
 
 @app.post("/cameras/connect", status_code=201)
-async def connect_camera(data: CameraConnect) -> dict:
+async def connect_camera(request: Request, data: CameraConnect) -> dict:
     """
     Universal camera registration.
       pull    — MediaMTX pulls RTSP from the camera.
       publish — Camera pushes to rtsp://<server>:8554/<camera_id>.
     """
+    require_perm(_user(request), "cameras:write")
     mode = data.connection_mode.lower()
     brand = data.brand.lower()
 
@@ -805,15 +958,17 @@ async def connect_camera(data: CameraConnect) -> dict:
     await pool.execute(
         """INSERT INTO cameras
            (camera_id, name, rtsp_url, brand, connection_mode, host, port,
-            username, channel, location_name, zone_type, latitude, longitude, active)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE)
+            username, channel, location_name, zone_type, latitude, longitude,
+            inference_fps, active)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,TRUE)
            ON CONFLICT (camera_id) DO UPDATE SET
              name=$2, rtsp_url=$3, brand=$4, connection_mode=$5, host=$6, port=$7,
              username=$8, channel=$9, location_name=$10, zone_type=$11,
-             latitude=$12, longitude=$13, active=TRUE""",
+             latitude=$12, longitude=$13, inference_fps=$14, active=TRUE""",
         data.camera_id, data.name, stored_url, brand, mode,
         data.host, data.port or 554, data.username, data.channel,
         data.location_name, data.zone_type, data.latitude, data.longitude,
+        _clamp_inference_fps(data.inference_fps),
     )
     await _register_mediamtx_path(data.camera_id, source_url, mode)
 
@@ -848,7 +1003,8 @@ async def connect_camera(data: CameraConnect) -> dict:
 
 
 @app.patch("/cameras/{camera_id}")
-async def update_camera(camera_id: str, data: CameraUpdate) -> dict:
+async def update_camera(request: Request, camera_id: str, data: CameraUpdate) -> dict:
+    require_perm(_user(request), "cameras:write")
     row = await pool.fetchrow(
         "SELECT * FROM cameras WHERE camera_id=$1 AND active=TRUE", camera_id
     )
@@ -864,13 +1020,17 @@ async def update_camera(camera_id: str, data: CameraUpdate) -> dict:
     name          = data.name          if data.name          is not None else row["name"]
     host          = data.host          if data.host          is not None else row["host"]
     port          = data.port          if data.port          is not None else (row["port"] or 554)
-    username      = data.username      if data.username      is not None else row["username"]
+    username      = data.username      if data.username      else row["username"]
     channel       = data.channel       if data.channel       is not None else (row["channel"] or 1)
     location_name = data.location_name if data.location_name is not None else row["location_name"]
     zone_type     = data.zone_type     if data.zone_type     is not None else row["zone_type"]
     latitude      = data.latitude      if data.latitude      is not None else row["latitude"]
     longitude     = data.longitude     if data.longitude     is not None else row["longitude"]
-    rtsp_url      = data.rtsp_url      if data.rtsp_url      is not None else row["rtsp_url"]
+    rtsp_url      = data.rtsp_url      if data.rtsp_url      else row["rtsp_url"]
+    if "inference_fps" in data.model_fields_set:
+        inference_fps = _clamp_inference_fps(data.inference_fps)
+    else:
+        inference_fps = row["inference_fps"] if "inference_fps" in row.keys() else None
 
     if mode == "publish":
         source_url = "publisher"
@@ -892,11 +1052,11 @@ async def update_camera(camera_id: str, data: CameraUpdate) -> dict:
         """UPDATE cameras SET
              name=$2, rtsp_url=$3, brand=$4, connection_mode=$5, host=$6, port=$7,
              username=$8, channel=$9, location_name=$10, zone_type=$11,
-             latitude=$12, longitude=$13
+             latitude=$12, longitude=$13, inference_fps=$14
            WHERE camera_id=$1""",
         camera_id, name, stored_url, brand, mode,
         host, port, username, channel,
-        location_name, zone_type, latitude, longitude,
+        location_name, zone_type, latitude, longitude, inference_fps,
     )
     # Restore active pull (undo any auth-error pause) before re-registering.
     await _restore_mediamtx_retries(camera_id)
@@ -906,7 +1066,8 @@ async def update_camera(camera_id: str, data: CameraUpdate) -> dict:
 
 
 @app.delete("/cameras/{camera_id}")
-async def disconnect_camera(camera_id: str) -> dict:
+async def disconnect_camera(request: Request, camera_id: str) -> dict:
+    require_perm(_user(request), "cameras:write")
     await pool.execute(
         "UPDATE cameras SET active=FALSE WHERE camera_id=$1", camera_id
     )
@@ -916,8 +1077,203 @@ async def disconnect_camera(camera_id: str) -> dict:
     return {"camera_id": camera_id, "status": "disconnected"}
 
 
+# ── Zone CRUD ──────────────────────────────────────────────────────────────────
+def _norm_points(pts: list[list[float]] | None, min_n: int, name: str) -> list[list[float]] | None:
+    if pts is None:
+        return None
+    if len(pts) < min_n:
+        raise HTTPException(400, f"{name} needs at least {min_n} points")
+    out: list[list[float]] = []
+    for p in pts:
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            raise HTTPException(400, f"{name} points must be [x, y] in 0–1")
+        x, y = float(p[0]), float(p[1])
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise HTTPException(400, f"{name} coordinates must be between 0 and 1")
+        out.append([round(x, 6), round(y, 6)])
+    return out
+
+
+def _zone_row(r: asyncpg.Record) -> dict:
+    stop_y = r["stop_line_y"]
+    ppm = r["speed_cal_ppm"]
+    created = r["created_at"]
+    return {
+        "id": str(r["id"]),
+        "camera_id": r["camera_id"],
+        "zone_type": r["zone_type"],
+        "zone_name": r["zone_name"],
+        "polygon_points": r["polygon_points_json"],
+        "line_points": r["lane_boundary_json"],
+        "stop_line_y": float(stop_y) if stop_y is not None else None,
+        "speed_limit_kmh": r["speed_limit_kmh"],
+        "speed_cal_ppm": float(ppm) if ppm is not None else None,
+        "camera_direction": r["camera_direction"] or "down",
+        "is_active": bool(r["is_active"]),
+        "created_at": created.isoformat() if created else None,
+    }
+
+
+def _validate_zone_payload(zone_type: str, polygon, line_pts, stop_line_y: float | None) -> None:
+    if zone_type not in ZONE_TYPES:
+        raise HTTPException(400, f"Unknown zone_type. Allowed: {sorted(ZONE_TYPES)}")
+    if zone_type in POLYGON_ZONE_TYPES and (not polygon or len(polygon) < 3):
+        raise HTTPException(400, f"{zone_type} requires polygon_points with at least 3 vertices")
+    if zone_type in LINE_ZONE_TYPES and (not line_pts or len(line_pts) < 2):
+        raise HTTPException(400, f"{zone_type} requires line_points with at least 2 points")
+    if zone_type == "stop_line" and stop_line_y is None:
+        raise HTTPException(400, "stop_line requires stop_line_y (0–1)")
+
+
+def _parse_zone_uuid(zone_id: str) -> str:
+    try:
+        return str(UUID(zone_id))
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid zone id") from exc
+
+
+_ZONE_SELECT = (
+    "SELECT id, camera_id, zone_type, zone_name, polygon_points_json, "
+    "stop_line_y, lane_boundary_json, speed_limit_kmh, speed_cal_ppm, "
+    "camera_direction, is_active, created_at FROM camera_zones"
+)
+
+
+@app.get("/zones")
+async def list_all_zones(request: Request, camera_id: str | None = None) -> list[dict]:
+    require_perm(_user(request), "cameras:read")
+    if camera_id:
+        rows = await pool.fetch(
+            _ZONE_SELECT + " WHERE camera_id=$1 AND is_active=TRUE ORDER BY created_at",
+            camera_id,
+        )
+    else:
+        rows = await pool.fetch(
+            _ZONE_SELECT + " WHERE is_active=TRUE ORDER BY camera_id, created_at"
+        )
+    return [_zone_row(r) for r in rows]
+
+
+@app.get("/cameras/{camera_id}/zones")
+async def list_camera_zones(request: Request, camera_id: str) -> list[dict]:
+    require_perm(_user(request), "cameras:read")
+    allowed = await allowed_camera_ids(pool, _user(request))
+    if allowed is not None and camera_id not in allowed:
+        raise HTTPException(404, "Camera not found")
+    exists = await pool.fetchval(
+        "SELECT 1 FROM cameras WHERE camera_id=$1 AND active=TRUE", camera_id
+    )
+    if not exists:
+        raise HTTPException(404, "Camera not found")
+    rows = await pool.fetch(
+        _ZONE_SELECT + " WHERE camera_id=$1 AND is_active=TRUE ORDER BY created_at",
+        camera_id,
+    )
+    return [_zone_row(r) for r in rows]
+
+
+@app.post("/cameras/{camera_id}/zones", status_code=201)
+async def create_camera_zone(request: Request, camera_id: str, data: ZoneCreate) -> dict:
+    require_perm(_user(request), "cameras:write")
+    exists = await pool.fetchval(
+        "SELECT 1 FROM cameras WHERE camera_id=$1 AND active=TRUE", camera_id
+    )
+    if not exists:
+        raise HTTPException(404, "Camera not found")
+    ztype = data.zone_type.strip().lower()
+    direction = (data.camera_direction or "down").strip().lower()
+    if direction not in ("down", "up", "side"):
+        raise HTTPException(400, "camera_direction must be down, up, or side")
+    polygon = _norm_points(data.polygon_points, 3, "polygon_points") if data.polygon_points else None
+    line_pts = _norm_points(data.line_points, 2, "line_points") if data.line_points else None
+    _validate_zone_payload(ztype, polygon, line_pts, data.stop_line_y)
+    row = await pool.fetchrow(
+        """INSERT INTO camera_zones
+           (camera_id, zone_type, zone_name, polygon_points_json, stop_line_y,
+            lane_boundary_json, speed_limit_kmh, speed_cal_ppm, camera_direction, is_active)
+           VALUES ($1,$2,$3,$4::jsonb,$5,$6::jsonb,$7,$8,$9,$10)
+           RETURNING id, camera_id, zone_type, zone_name, polygon_points_json,
+                     stop_line_y, lane_boundary_json, speed_limit_kmh, speed_cal_ppm,
+                     camera_direction, is_active, created_at""",
+        camera_id, ztype, data.zone_name,
+        json.dumps(polygon) if polygon else None,
+        data.stop_line_y,
+        json.dumps(line_pts) if line_pts else None,
+        data.speed_limit_kmh or 60,
+        data.speed_cal_ppm or 100.0,
+        direction,
+        data.is_active,
+    )
+    log.info("zone_created", camera_id=camera_id, zone_id=str(row["id"]), zone_type=ztype)
+    return _zone_row(row)
+
+
+@app.patch("/cameras/{camera_id}/zones/{zone_id}")
+async def update_camera_zone(request: Request, camera_id: str, zone_id: str, data: ZoneUpdate) -> dict:
+    require_perm(_user(request), "cameras:write")
+    zid = _parse_zone_uuid(zone_id)
+    row = await pool.fetchrow(
+        _ZONE_SELECT + " WHERE id=$1::uuid AND camera_id=$2", zid, camera_id
+    )
+    if not row:
+        raise HTTPException(404, "Zone not found")
+    ztype = (data.zone_type or row["zone_type"]).strip().lower()
+    direction = (data.camera_direction if data.camera_direction is not None else (row["camera_direction"] or "down"))
+    direction = str(direction).strip().lower()
+    if direction not in ("down", "up", "side"):
+        raise HTTPException(400, "camera_direction must be down, up, or side")
+    if "polygon_points" in data.model_fields_set:
+        polygon = _norm_points(data.polygon_points, 3, "polygon_points") if data.polygon_points else None
+    else:
+        polygon = row["polygon_points_json"]
+    if "line_points" in data.model_fields_set:
+        line_pts = _norm_points(data.line_points, 2, "line_points") if data.line_points else None
+    else:
+        line_pts = row["lane_boundary_json"]
+    stop_y = data.stop_line_y if "stop_line_y" in data.model_fields_set else (
+        float(row["stop_line_y"]) if row["stop_line_y"] is not None else None
+    )
+    _validate_zone_payload(ztype, polygon, line_pts, stop_y)
+    name = data.zone_name if "zone_name" in data.model_fields_set else row["zone_name"]
+    is_active = data.is_active if data.is_active is not None else row["is_active"]
+    speed_limit = data.speed_limit_kmh if data.speed_limit_kmh is not None else (row["speed_limit_kmh"] or 60)
+    ppm = data.speed_cal_ppm if data.speed_cal_ppm is not None else (float(row["speed_cal_ppm"] or 100.0))
+    updated = await pool.fetchrow(
+        """UPDATE camera_zones SET
+             zone_type=$3, zone_name=$4, polygon_points_json=$5::jsonb, stop_line_y=$6,
+             lane_boundary_json=$7::jsonb, speed_limit_kmh=$8, speed_cal_ppm=$9,
+             camera_direction=$10, is_active=$11
+           WHERE id=$1::uuid AND camera_id=$2
+           RETURNING id, camera_id, zone_type, zone_name, polygon_points_json,
+                     stop_line_y, lane_boundary_json, speed_limit_kmh, speed_cal_ppm,
+                     camera_direction, is_active, created_at""",
+        zid, camera_id, ztype, name,
+        json.dumps(polygon) if polygon else None,
+        stop_y,
+        json.dumps(line_pts) if line_pts else None,
+        speed_limit, ppm, direction, is_active,
+    )
+    log.info("zone_updated", camera_id=camera_id, zone_id=zid)
+    return _zone_row(updated)
+
+
+@app.delete("/cameras/{camera_id}/zones/{zone_id}")
+async def delete_camera_zone(request: Request, camera_id: str, zone_id: str) -> dict:
+    require_perm(_user(request), "cameras:write")
+    zid = _parse_zone_uuid(zone_id)
+    result = await pool.execute(
+        "UPDATE camera_zones SET is_active=FALSE WHERE id=$1::uuid AND camera_id=$2 AND is_active=TRUE",
+        zid, camera_id,
+    )
+    if result == "UPDATE 0":
+        raise HTTPException(404, "Zone not found")
+    log.info("zone_deleted", camera_id=camera_id, zone_id=zid)
+    return {"id": zid, "camera_id": camera_id, "status": "deleted"}
+
+
 @app.post("/cameras/{camera_id}/test", response_model=None)
-async def test_camera(camera_id: str) -> JSONResponse | dict:
+async def test_camera(request: Request, camera_id: str) -> JSONResponse | dict:
+    require_perm(_user(request), "cameras:test")
     """
     Test camera stream via MediaMTX; run ffprobe on pull cameras for
     a human-readable error when the stream is not live.
@@ -973,7 +1329,8 @@ async def test_camera(camera_id: str) -> JSONResponse | dict:
 
 
 @app.get("/cameras/{camera_id}/snapshot")
-async def get_snapshot(camera_id: str) -> dict:
+async def get_snapshot(request: Request, camera_id: str) -> dict:
+    require_perm(_user(request), "cameras:read")
     url = f"{RTSP_BASE_URL}/{camera_id}"
     frame_b64 = capture_snapshot(url)
     if not frame_b64:

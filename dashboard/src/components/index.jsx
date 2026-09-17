@@ -1,4 +1,15 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { WhepPlayer } from "./player";
+import { VirtualList } from "./VirtualList";
+import { authMediaUrl } from "../lib/auth";
+import { overlayFps } from "../lib/perf";
+import {
+  VIDEO_INGEST_URL, WHEP_BASE, HLS_BASE, TRAFFIC_AI_URL, TRAFFIC_AI_WS,
+  SEVERITY, ALERT_LABELS, toPlayerCamera,
+} from "../lib/constants";
+import { IconEmpty, IconCheck } from "../lib/icons";
+
+export { SEVERITY, ALERT_LABELS };
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 function useIsMobile(bp = 680) {
@@ -12,41 +23,18 @@ function useIsMobile(bp = 680) {
   return m;
 }
 
-export const SEVERITY = {
-  4: { bn: "জরুরি",   en: "Critical", color: "#ef4444", bg: "rgba(239,68,68,0.15)" },
-  3: { bn: "উচ্চ",    en: "High",     color: "#f59e0b", bg: "rgba(245,158,11,0.15)" },
-  2: { bn: "মাঝারি",  en: "Medium",   color: "#3b82f6", bg: "rgba(59,130,246,0.15)" },
-  1: { bn: "নিম্ন",   en: "Low",      color: "#10b981", bg: "rgba(16,185,129,0.15)" },
-};
-
-export const ALERT_LABELS = {
-  red_light_violation:  { bn: "লাল বাতি লঙ্ঘন",    en: "Red light violation" },
-  wrong_lane:           { bn: "ভুল লেন",            en: "Wrong lane" },
-  helmet_missing:       { bn: "হেলমেট নেই",          en: "No helmet" },
-  face_match:           { bn: "মুখাবয়ব মিলেছে",     en: "Face match" },
-  crowd_dense:          { bn: "ভিড় সতর্কতা",        en: "Crowd alert" },
-  stop_line_violation:  { bn: "স্টপ লাইন লঙ্ঘন",   en: "Stop line violation" },
-  person_down:          { bn: "ব্যক্তি পড়ে গেছে",  en: "Person down" },
-  fire_smoke:           { bn: "আগুন / ধোঁয়া",      en: "Fire / smoke" },
-  abandoned_object:     { bn: "পরিত্যক্ত বস্তু",   en: "Abandoned object" },
-  illegal_parking:      { bn: "অবৈধ পার্কিং",       en: "Illegal parking" },
-  speeding:             { bn: "অতিরিক্ত গতি",       en: "Speeding" },
-};
-
-const VIDEO_INGEST_URL = import.meta.env.VITE_VIDEO_INGEST_URL || "http://localhost:8001";
-const WHEP_BASE        = import.meta.env.VITE_MEDIAMTX_WHEP_URL || "http://localhost:8889";
-const HLS_BASE         = import.meta.env.VITE_MEDIAMTX_HLS_URL  || "http://localhost:8888";
-const TRAFFIC_AI_URL   = import.meta.env.VITE_TRAFFIC_AI_URL    || "http://localhost:8002";
-const TRAFFIC_AI_WS    = TRAFFIC_AI_URL.replace(/^http/, "ws");
-
 const CHART_COLORS = ["#3b82f6","#ef4444","#f59e0b","#10b981","#8b5cf6","#ec4899","#06b6d4","#f97316"];
 
 // ── Status bar ────────────────────────────────────────────────────────────────
 export function StatusBar({ alertCount, pendingCount, language }) {
   const t = (bn, en) => language === "bn" ? bn : en;
   const [now, setNow] = useState(new Date().toLocaleTimeString());
+  const [fps, setFps] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => setNow(new Date().toLocaleTimeString()), 1000);
+    const id = setInterval(() => {
+      setNow(new Date().toLocaleTimeString());
+      setFps(overlayFps());
+    }, 1000);
     return () => clearInterval(id);
   }, []);
   return (
@@ -55,7 +43,9 @@ export function StatusBar({ alertCount, pendingCount, language }) {
       <span className="sep">·</span>
       <span>{t("মুলতুবি", "Pending")}: <span className="stat-pending">{pendingCount}</span></span>
       <span className="sep">·</span>
-      <span className="ai-note">{t("এআই সহায়তা করে। পুলিশ সিদ্ধান্ত নেয়।", "AI assists. Police decide.")}</span>
+      <span>{t("ওভারলে", "Overlay")}: <span className="stat-value">{fps}</span> fps</span>
+      <span className="sep">·</span>
+      <span className="ai-note">{t("এআই সহায়তা করে। অপারেটর সিদ্ধান্ত নেয়।", "AI assists. Operators decide.")}</span>
       <span className="time">{now}</span>
     </footer>
   );
@@ -113,7 +103,7 @@ export function CommandCenter({ cameras, alerts, language, onAlertSelect }) {
         <div className="cc-camera-grid">
           {cameras.length === 0 && (
             <div className="cc-empty">
-              <span className="empty-icon">📷</span>
+              <span className="empty-icon"><IconEmpty /></span>
               {t("কোনো ক্যামেরা নেই", "No cameras configured")}
             </div>
           )}
@@ -126,12 +116,12 @@ export function CommandCenter({ cameras, alerts, language, onAlertSelect }) {
                   <span className={`cam-status-dot ${cam.streaming || cam.stream_status === "live" ? "live" : "error"}`} />
                   <span className="cc-cam-name">{cam.name || cam.camera_id}</span>
                   <span className="cc-cam-location">{cam.location_name || ""}</span>
-                  {isAlert && <span className="cc-violation-badge">⚠ {t("লঙ্ঘন", "VIOLATION")}</span>}
+                  {isAlert && <span className="cc-violation-badge">{t("লঙ্ঘন", "Alert")}</span>}
                   <span className="cc-cam-id">{cam.camera_id}</span>
                 </div>
                 <img
                   className="cc-cam-video"
-                  src={`${TRAFFIC_AI_URL}/preview/${cam.camera_id}.mjpg`}
+                  src={authMediaUrl(`${TRAFFIC_AI_URL}/preview/${cam.camera_id}.mjpg`)}
                   alt={cam.name || cam.camera_id}
                 />
               </div>
@@ -149,7 +139,7 @@ export function CommandCenter({ cameras, alerts, language, onAlertSelect }) {
           <div className="cc-feed-scroll">
             {pending.length === 0 && (
               <div className="cc-feed-empty">
-                <span>✅</span>
+                <span className="empty-icon"><IconCheck /></span>
                 {t("কোনো মুলতুবি সতর্কতা নেই", "No pending alerts")}
               </div>
             )}
@@ -183,103 +173,6 @@ export function CommandCenter({ cameras, alerts, language, onAlertSelect }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// DETECTION CANVAS  — WebSocket bbox overlay on the live <video>
-// ═══════════════════════════════════════════════════════════════════════════════
-function DetectionCanvas({ cameraId, videoRef }) {
-  const canvasRef = useRef(null);
-
-  useEffect(() => {
-    if (!cameraId) return;
-    const url = `${TRAFFIC_AI_WS}/detections/${cameraId}/ws`;
-    let ws, reconnectTimer, pingTimer;
-
-    function connect() {
-      ws = new WebSocket(url);
-
-      ws.onopen = () => {
-        pingTimer = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) ws.send("ping");
-        }, 20000);
-      };
-
-      ws.onmessage = (evt) => {
-        if (evt.data === "pong") return;
-        let data;
-        try { data = JSON.parse(evt.data); } catch { return; }
-        if (data.type !== "detections") return;
-        draw(data);
-      };
-
-      ws.onclose = () => {
-        clearInterval(pingTimer);
-        reconnectTimer = setTimeout(connect, 3000);
-      };
-
-      ws.onerror = () => ws.close();
-    }
-
-    function draw(data) {
-      const canvas = canvasRef.current;
-      const video  = videoRef?.current;
-      if (!canvas) return;
-      const W = video?.clientWidth  || 640;
-      const H = video?.clientHeight || 360;
-      if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
-      const ctx  = canvas.getContext("2d");
-      const srcW = data.frame_w || 640;
-      const srcH = data.frame_h || 360;
-      const sx = W / srcW;
-      const sy = H / srcH;
-      ctx.clearRect(0, 0, W, H);
-
-      (data.detections || []).forEach(det => {
-        const [x1, y1, x2, y2] = det.bbox;
-        const rx1 = x1 * sx, ry1 = y1 * sy, rw = (x2 - x1) * sx, rh = (y2 - y1) * sy;
-        const isV  = !!det.violation;
-        const col  = isV ? "#ef4444" : "#22c55e";
-        ctx.strokeStyle = col;
-        ctx.lineWidth   = isV ? 3 : 1.5;
-        ctx.strokeRect(rx1, ry1, rw, rh);
-        const label = isV
-          ? `⚠ ${det.violation.replace(/_/g," ")} [${det.class}]${det.track_id != null ? " #"+det.track_id : ""}`
-          : `${det.class} ${(det.confidence*100).toFixed(0)}%${det.track_id != null ? " #"+det.track_id : ""}`;
-        ctx.font = "11px monospace";
-        const tw = ctx.measureText(label).width + 8;
-        const ly = ry1 > 18 ? ry1 - 16 : ry1 + rh;
-        ctx.fillStyle = col;
-        ctx.fillRect(rx1, ly, tw, 16);
-        ctx.fillStyle = isV ? "#fff" : "#000";
-        ctx.fillText(label, rx1 + 4, ly + 11);
-      });
-
-      const n = (data.detections || []).length;
-      if (n > 0) {
-        ctx.font = "bold 11px monospace";
-        ctx.fillStyle = "rgba(0,0,0,0.65)";
-        ctx.fillRect(4, 4, 130, 18);
-        ctx.fillStyle = "#22c55e";
-        ctx.fillText(`${n} object${n > 1 ? "s" : ""} detected`, 8, 16);
-      }
-    }
-
-    connect();
-    return () => {
-      clearInterval(pingTimer);
-      clearTimeout(reconnectTimer);
-      if (ws) { ws.onclose = null; ws.close(); }
-    };
-  }, [cameraId]);
-
-  return (
-    <canvas ref={canvasRef} style={{
-      position: "absolute", top: 0, left: 0,
-      width: "100%", height: "100%",
-      pointerEvents: "none", zIndex: 2,
-    }} />
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // CAMERA GRID
 // ═══════════════════════════════════════════════════════════════════════════════
 const FALLBACK_BRANDS = [
@@ -294,7 +187,7 @@ const FALLBACK_BRANDS = [
   { id: "custom",    label: "Custom URL",      notes: "Paste full RTSP URL from camera manual" },
 ];
 
-export function CameraGrid({ language }) {
+export function CameraGrid({ language, canManage = true }) {
   const [cameras,   setCameras]   = useState([]);
   const [brands,    setBrands]    = useState([]);
   const [showForm,  setShowForm]  = useState(false);
@@ -309,6 +202,7 @@ export function CameraGrid({ language }) {
       camera_id: "", name: "", brand: "hikvision", connection_mode: "pull",
       host: "", port: 554, username: "", password: "", channel: 1,
       rtsp_url: "", location_name: "", zone_type: "entry_exit",
+      inference_fps: "",
     };
   }
 
@@ -318,7 +212,7 @@ export function CameraGrid({ language }) {
         fetch(`${VIDEO_INGEST_URL}/cameras`).then(r => r.json()),
         fetch(`${VIDEO_INGEST_URL}/cameras/brands`).then(r => r.json()),
       ]);
-      setCameras(c); setBrands(b.brands || []);
+      setCameras(Array.isArray(c) ? c : []); setBrands(b.brands || []);
     } catch {}
   };
 
@@ -341,6 +235,7 @@ export function CameraGrid({ language }) {
         username: cam.username || "", password: "",
         channel: cam.channel || 1, rtsp_url: cam.rtsp_url || "",
         location_name: cam.location_name || "", zone_type: cam.zone_type || "entry_exit",
+        inference_fps: cam.inference_fps ?? "",
       });
       setShowForm(true);
     } catch (err) {
@@ -371,6 +266,14 @@ export function CameraGrid({ language }) {
     try {
       const payload = { ...form };
       if (editingId && !payload.password) delete payload.password;
+      if (editingId && !payload.username) delete payload.username;
+      if (editingId && !payload.rtsp_url) delete payload.rtsp_url;
+      if (payload.inference_fps === "" || payload.inference_fps == null) {
+        if (editingId) payload.inference_fps = null;
+        else delete payload.inference_fps;
+      } else {
+        payload.inference_fps = Number(payload.inference_fps);
+      }
       const url    = editingId ? `${VIDEO_INGEST_URL}/cameras/${editingId}` : `${VIDEO_INGEST_URL}/cameras/connect`;
       const method = editingId ? "PATCH" : "POST";
       const r = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -386,13 +289,15 @@ export function CameraGrid({ language }) {
     <div className="camera-grid">
       <div className="grid-header">
         <div className="grid-title">
-          {t("লাইভ ক্যামেরা", "Live cameras")}
+          {t("ক্যামেরা", "Cameras")}
           <span className="grid-count">{cameras.length}</span>
         </div>
+        {canManage && (
         <button className="btn-primary btn-sm"
           onClick={() => showForm && !editingId ? (setShowForm(false), resetForm()) : openAddForm()}>
           {showForm && !editingId ? t("বাতিল", "Cancel") : t("+ ক্যামেরা যোগ", "+ Add camera")}
         </button>
+        )}
       </div>
 
       {showForm && (
@@ -431,8 +336,8 @@ export function CameraGrid({ language }) {
               <div className="form-section-title">{t("কাস্টম RTSP URL", "Custom RTSP URL")}</div>
               <div className="form-row">
                 <label>{t("সম্পূর্ণ RTSP URL", "Full RTSP URL")} *</label>
-                <input required className="rtsp-url-input"
-                  placeholder="rtsp://admin:password@192.168.1.50:554/stream1"
+                <input required={!editingId} className="rtsp-url-input"
+                  placeholder={editingId ? t("খালি = আগের URL", "Leave blank to keep current") : "rtsp://USER:PASSWORD@192.168.1.50:554/stream1"}
                   value={form.rtsp_url} onChange={e => setForm({ ...form, rtsp_url: e.target.value.trim() })} />
               </div>
             </div>
@@ -450,7 +355,7 @@ export function CameraGrid({ language }) {
               </div>
               <div className="form-row">
                 <label>{t("ইউজার", "Username")}</label>
-                <input placeholder="admin" value={form.username} onChange={e => setForm({ ...form, username: e.target.value })} />
+                <input placeholder={editingId ? t("খালি = আগের ইউজার", "Leave blank to keep current") : "admin"} value={form.username} onChange={e => setForm({ ...form, username: e.target.value })} />
               </div>
               <div className="form-row">
                 <label>{t("পাসওয়ার্ড", "Password")}</label>
@@ -474,6 +379,13 @@ export function CameraGrid({ language }) {
             <label>{t("অবস্থান", "Location")}</label>
             <input value={form.location_name} onChange={e => setForm({ ...form, location_name: e.target.value })} />
           </div>
+          <div className="form-row">
+            <label>{t("AI FPS", "Inference FPS")}</label>
+            <input type="number" min="1" max="25" placeholder={t("খালি = ডিফল্ট", "blank = default")}
+              value={form.inference_fps}
+              onChange={e => setForm({ ...form, inference_fps: e.target.value })} />
+            <span className="form-hint">{t("ডিসপ্লে FPS নয় — শুধু YOLO। ১–২৫, খালি = CAMERA_FPS।", "Not display FPS — YOLO only. 1–25, blank = CAMERA_FPS.")}</span>
+          </div>
           <div className="form-actions">
             <button type="submit" className="btn-primary" disabled={busy}>
               {busy ? t("সংরক্ষণ হচ্ছে…", "Saving…") : editingId ? t("আপডেট করুন", "Update") : t("সংযুক্ত করুন", "Connect")}
@@ -491,26 +403,16 @@ export function CameraGrid({ language }) {
       <div className="camera-cells">
         {cameras.length === 0 && (
           <div className="empty-state" style={{ gridColumn: "1/-1" }}>
-            <span className="empty-icon">📷</span>
+            <span className="empty-icon"><IconEmpty /></span>
             {t("কোনো ক্যামেরা নেই — উপরে যোগ করুন", "No cameras — add one above")}
           </div>
         )}
         {cameras.map(cam => (
           <WhepPlayer key={cam.camera_id}
-            camera={{
-              id: cam.camera_id, name: cam.name, streaming: cam.streaming,
-              stream_status: cam.stream_status, status_message: cam.status_message,
-              connection_mode: cam.connection_mode, brand: cam.brand,
-              location: cam.location_name,
-              whep: cam.whep_url  || `${WHEP_BASE}/${cam.camera_id}/whep`,
-              hls:  cam.hls_url   || `${HLS_BASE}/${cam.camera_id}/index.m3u8`,
-              playback_mode: cam.playback_mode,
-              webrtc_compatible: cam.webrtc_compatible !== false,
-              video_codec: cam.video_codec,
-            }}
+            camera={toPlayerCamera(cam)}
             language={language}
-            onEdit={() => openEditForm(cam.camera_id)}
-            onDelete={() => onDelete(cam.camera_id, cam.name)}
+            onEdit={canManage ? () => openEditForm(cam.camera_id) : undefined}
+            onDelete={canManage ? () => onDelete(cam.camera_id, cam.name) : undefined}
             onRefresh={load}
           />
         ))}
@@ -519,182 +421,13 @@ export function CameraGrid({ language }) {
   );
 }
 
-// ── WhepPlayer ─────────────────────────────────────────────────────────────────
-function WhepPlayer({ camera, language, onEdit, onDelete, onRefresh }) {
-  const videoRef  = useRef(null);
-  const hlsRef    = useRef(null);
-  const timerRef  = useRef(null);
-  const [status,     setStatus]     = useState("connecting");
-  const [errorMsg,   setErrorMsg]   = useState(camera.status_message || "");
-  const [testResult, setTestResult] = useState(null);
-  const [testBusy,   setTestBusy]   = useState(false);
-  // "live" = raw WebRTC/HLS  |  "ai" = canvas bbox overlay on live  |  "mjpeg" = server annotated
-  const [viewMode,   setViewMode]   = useState("live");
-  const t = (bn, en) => language === "bn" ? bn : en;
-
-  const showTestResult = (r) => {
-    clearTimeout(timerRef.current);
-    setTestResult(r);
-    timerRef.current = setTimeout(() => setTestResult(null), 6000);
-  };
-  useEffect(() => () => clearTimeout(timerRef.current), []);
-
-  const runTest = async () => {
-    if (testBusy) return;
-    setTestBusy(true); setTestResult(null);
-    try {
-      const r = await fetch(`${VIDEO_INGEST_URL}/cameras/${camera.id}/test`, { method: "POST" });
-      const d = await r.json().catch(() => ({}));
-      const ok = d.ok === true || (r.ok && d.ok !== false);
-      showTestResult({ ok, text: ok ? (d.status_message || "Connection OK") : (d.error || d.status_message || `Error ${r.status}`) });
-      if (ok) onRefresh?.();
-    } catch (e) { showTestResult({ ok: false, text: e.message || "Network error" }); }
-    finally { setTestBusy(false); }
-  };
-
-  useEffect(() => {
-    setErrorMsg(camera.status_message || "");
-    if (camera.stream_status !== "live") {
-      setStatus(camera.stream_status === "waiting" ? "waiting" : "error");
-      return;
-    }
-    if (viewMode === "ai" || viewMode === "mjpeg") { setStatus("live"); return; }
-
-    let pc = null, cancelled = false;
-
-    async function connectHls() {
-      const video = videoRef.current;
-      if (!video || cancelled) return;
-      setStatus("connecting");
-      try {
-        if (video.canPlayType("application/vnd.apple.mpegurl")) {
-          video.src = camera.hls; await video.play();
-          if (!cancelled) setStatus("live"); return;
-        }
-        const { default: Hls } = await import("hls.js");
-        if (!Hls.isSupported()) throw new Error("HLS not supported");
-        const hls = new Hls({ enableWorker: true, lowLatencyMode: true });
-        hlsRef.current = hls;
-        hls.loadSource(camera.hls); hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!cancelled) { video.play().catch(() => {}); setStatus("live"); } });
-        hls.on(Hls.Events.ERROR, (_, d) => { if (!cancelled && d.fatal) { setStatus("error"); setErrorMsg("HLS playback failed"); } });
-      } catch { if (!cancelled) { setStatus("error"); setErrorMsg("HLS playback failed"); } }
-    }
-
-    async function connectWhep() {
-      setStatus("connecting");
-      pc = new RTCPeerConnection({ iceServers: [] });
-      pc.ontrack = e => { if (!cancelled && videoRef.current && e.streams[0]) { videoRef.current.srcObject = e.streams[0]; setStatus("live"); } };
-      pc.oniceconnectionstatechange = () => { if (pc?.iceConnectionState === "failed") setStatus("error"); };
-      pc.addTransceiver("video", { direction: "recvonly" });
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      const resp = await fetch(camera.whep, { method: "POST", headers: { "Content-Type": "application/sdp" }, body: offer.sdp });
-      if (cancelled) return;
-      if (resp.ok) {
-        await pc.setRemoteDescription({ type: "answer", sdp: await resp.text() });
-      } else {
-        const body = await resp.text().catch(() => "");
-        if (body.includes("codecs not supported") || camera.playback_mode === "hls") { pc.close(); pc = null; await connectHls(); return; }
-        setStatus("error"); setErrorMsg("WHEP failed — click Test (⚡) to diagnose");
-      }
-    }
-
-    async function connect() {
-      if (camera.playback_mode === "hls") await connectHls();
-      else { try { await connectWhep(); } catch { if (!cancelled) await connectHls(); } }
-    }
-
-    connect();
-    return () => {
-      cancelled = true; pc?.close();
-      hlsRef.current?.destroy(); hlsRef.current = null;
-      if (videoRef.current) { videoRef.current.removeAttribute("src"); videoRef.current.srcObject = null; }
-    };
-  }, [camera.whep, camera.hls, camera.stream_status, camera.status_message, camera.playback_mode, camera.webrtc_compatible, camera.video_codec, viewMode]);
-
-  const statusLabel = {
-    live: t("লাইভ","Live"), connecting: t("সংযোগ হচ্ছে…","Connecting…"),
-    waiting: t("অপেক্ষমান","Waiting"), error: t("সমস্যা","No video"),
-  }[status] || status;
-
-  return (
-    <div className="camera-cell">
-      <div className="camera-label">
-        <span className={`cam-status-dot ${status}`} />
-        <span className="camera-title-group">
-          <span className="camera-name">{camera.name}</span>
-          <span className="cam-id">{camera.id}</span>
-          <span className={`cam-mode-badge mode-${camera.connection_mode}`}>
-            {camera.connection_mode === "publish" ? "Push" : "Pull"}
-          </span>
-          <span className={`cam-status-badge status-${status}`}>{statusLabel}</span>
-        </span>
-        <span className="camera-actions">
-          <button type="button"
-            className={`btn-ai-toggle ${viewMode !== "live" ? "active" : ""}`}
-            title="Cycle: Live → AI Canvas Overlay → MJPEG"
-            onClick={() => setViewMode(m => m === "live" ? "ai" : m === "ai" ? "mjpeg" : "live")}>
-            {viewMode === "live" ? "AI" : viewMode === "ai" ? "MJPEG" : t("লাইভ","Live")}
-          </button>
-          <button type="button" className={`btn-icon ${testBusy ? "btn-icon-busy" : ""}`}
-            title={t("টেস্ট","Test connection")} onClick={runTest} disabled={testBusy}>
-            {testBusy ? "…" : "⚡"}
-          </button>
-          <button type="button" className="btn-icon" title={t("সম্পাদনা","Edit")} onClick={onEdit}>✎</button>
-          <button type="button" className="btn-icon btn-icon-danger" title={t("মুছুন","Delete")} onClick={onDelete}>✕</button>
-        </span>
-      </div>
-
-      {testResult && (
-        <div className={`cam-test-result ${testResult.ok ? "cam-test-ok" : "cam-test-err"}`}>
-          {testResult.ok ? "✓" : "✗"} {testResult.text}
-          <button className="cam-test-close" onClick={() => setTestResult(null)}>×</button>
-        </div>
-      )}
-      {!testResult && (status === "error" || status === "waiting" || camera.video_codec === "H265") && errorMsg && (
-        <div className="cam-status-msg">{errorMsg}</div>
-      )}
-
-      <div className="video-container" style={{ position: "relative" }}>
-        {viewMode === "mjpeg" ? (
-          <>
-            <img className="camera-video"
-              src={`${TRAFFIC_AI_URL}/preview/${camera.id}.mjpg`} alt={`AI ${camera.id}`}
-              onError={() => setErrorMsg(t("AI stream পাওয়া যায়নি","AI stream unavailable"))} />
-            <span className="ai-overlay-badge">{t("● MJPEG AI","● MJPEG AI")}</span>
-          </>
-        ) : status !== "live" && status !== "connecting" ? (
-          <div className="cam-offline">
-            <span className="cam-offline-icon">{status === "waiting" ? "⏳" : "📵"}</span>
-            {status === "waiting" ? t("ক্যামেরা push এর অপেক্ষা","Waiting for camera push") : t("ভিডিও নেই","No video")}
-          </div>
-        ) : (
-          <>
-            <video ref={videoRef} autoPlay muted playsInline className="camera-video" />
-            {viewMode === "ai" && status === "live" && (
-              <>
-                <DetectionCanvas cameraId={camera.id} videoRef={videoRef} />
-                <span className="ai-overlay-badge">{t("● AI ওভারলে","● AI Overlay")}</span>
-              </>
-            )}
-          </>
-        )}
-        {viewMode === "live" && status === "connecting" && (
-          <div className="cam-connecting">
-            <span className="cam-offline-icon">📡</span>
-            {t("সংযোগ হচ্ছে…","Connecting…")}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // ALERT PANEL
 // ═══════════════════════════════════════════════════════════════════════════════
-export function AlertPanel({ alerts, language, onAccept, onReject, onEscalate }) {
+export function AlertPanel({
+  alerts, language, onAccept, onReject, onEscalate, apiUrl,
+  onInvestigate, onResolve, onAssign, officerId, canAct = true,
+}) {
   const [selected, setSelected] = useState(null);
   const isMobile = useIsMobile(760);
   const t = (bn, en) => language === "bn" ? bn : en;
@@ -704,6 +437,33 @@ export function AlertPanel({ alerts, language, onAccept, onReject, onEscalate })
   const handleAccept   = () => { onAccept(selected.alert_id);   setSelected(null); };
   const handleReject   = () => { onReject(selected.alert_id);   setSelected(null); };
   const handleEscalate = () => { onEscalate(selected.alert_id); setSelected(null); };
+  const detailProps = {
+    language, apiUrl, officerId,
+    onBack: isMobile ? handleBack : undefined,
+    onAccept: handleAccept, onReject: handleReject, onEscalate: handleEscalate,
+    onInvestigate: (id, notes) => { onInvestigate?.(id, notes); setSelected(null); },
+    onResolve: (id, notes) => { onResolve?.(id, notes); setSelected(null); },
+    onAssign: (id, who) => { onAssign?.(id, who); setSelected(null); },
+    canAct,
+  };
+
+  const listBody = pending.length === 0 ? (
+    <div className="empty-state"><span className="empty-icon"><IconCheck /></span>{t("কোনো মুলতুবি সতর্কতা নেই","No pending alerts")}</div>
+  ) : pending.length > 24 ? (
+    <VirtualList
+      className="alert-list-scroll"
+      items={pending}
+      rowHeight={92}
+      height={520}
+      renderRow={(a) => (
+        <AlertCard alert={a} selected={selected?.alert_id === a.alert_id} language={language} onClick={() => setSelected(a)} />
+      )}
+    />
+  ) : (
+    <div className="alert-list-scroll">
+      {pending.map(a => <AlertCard key={a.alert_id} alert={a} selected={selected?.alert_id === a.alert_id} language={language} onClick={() => setSelected(a)} />)}
+    </div>
+  );
 
   if (isMobile) {
     return (
@@ -714,14 +474,11 @@ export function AlertPanel({ alerts, language, onAccept, onReject, onEscalate })
               <span className="list-title">{t("সতর্কতা তালিকা","Alert list")}</span>
               <span className="list-count">{pending.length} {t("মুলতুবি","pending")}</span>
             </div>
-            <div className="alert-list-scroll">
-              {pending.length === 0 && <div className="empty-state"><span className="empty-icon">✅</span>{t("কোনো মুলতুবি সতর্কতা নেই","No pending alerts")}</div>}
-              {pending.map(a => <AlertCard key={a.alert_id} alert={a} selected={false} language={language} onClick={() => setSelected(a)} />)}
-            </div>
+            {listBody}
           </div>
         ) : (
           <div className="alert-detail-panel">
-            <AlertDetail alert={selected} language={language} onBack={handleBack} onAccept={handleAccept} onReject={handleReject} onEscalate={handleEscalate} />
+            <AlertDetail alert={selected} {...detailProps} />
           </div>
         )}
       </div>
@@ -735,15 +492,12 @@ export function AlertPanel({ alerts, language, onAccept, onReject, onEscalate })
           <span className="list-title">{t("সতর্কতা তালিকা","Alert list")}</span>
           <span className="list-count">{pending.length} {t("মুলতুবি","pending")}</span>
         </div>
-        <div className="alert-list-scroll">
-          {pending.length === 0 && <div className="empty-state"><span className="empty-icon">✅</span>{t("কোনো মুলতুবি সতর্কতা নেই","No pending alerts")}</div>}
-          {pending.map(a => <AlertCard key={a.alert_id} alert={a} selected={selected?.alert_id === a.alert_id} language={language} onClick={() => setSelected(a)} />)}
-        </div>
+        {listBody}
       </div>
       <div className="alert-detail-panel">
         {!selected
-          ? <div className="no-selection"><span className="no-selection-icon">👆</span>{t("বাম থেকে একটি সতর্কতা নির্বাচন করুন","Select an alert from the left to review")}</div>
-          : <AlertDetail alert={selected} language={language} onAccept={handleAccept} onReject={handleReject} onEscalate={handleEscalate} />
+          ? <div className="no-selection"><span className="no-selection-icon"><IconEmpty /></span>{t("বাম থেকে একটি সতর্কতা নির্বাচন করুন","Select an alert from the left to review")}</div>
+          : <AlertDetail alert={selected} {...detailProps} />
         }
       </div>
     </div>
@@ -773,9 +527,43 @@ function AlertCard({ alert, selected, language, onClick }) {
   );
 }
 
-function AlertDetail({ alert, language, onBack, onAccept, onReject, onEscalate }) {
+function AlertDetail({
+  alert, language, onBack, onAccept, onReject, onEscalate, apiUrl,
+  onInvestigate, onResolve, onAssign, officerId, canAct = true,
+}) {
   const t = (bn, en) => language === "bn" ? bn : en;
   const sev = SEVERITY[alert.severity];
+  const [detail, setDetail] = useState(alert);
+  const [note, setNote] = useState("");
+  const [assignee, setAssignee] = useState(officerId || "");
+
+  useEffect(() => {
+    setDetail(alert);
+    if (!apiUrl || !alert?.alert_id) return;
+    let cancelled = false;
+    fetch(`${apiUrl}/alerts/${alert.alert_id}`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (!cancelled && d) setDetail({ ...alert, ...d }); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [alert, apiUrl]);
+
+  const saveNote = async () => {
+    const text = note.trim();
+    if (!text || !apiUrl) return;
+    try {
+      const r = await fetch(`${apiUrl}/alerts/${alert.alert_id}/notes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note: text, officer_id: officerId }),
+      });
+      if (r.ok) {
+        const saved = await r.json();
+        setDetail(prev => ({ ...prev, notes: [...(prev.notes || []), saved] }));
+        setNote("");
+      }
+    } catch {}
+  };
   return (
     <div className="detail-view">
       {onBack && <button className="detail-back-btn" onClick={onBack}>← {t("তালিকায় ফিরুন","Back to list")}</button>}
@@ -790,14 +578,16 @@ function AlertDetail({ alert, language, onBack, onAccept, onReject, onEscalate }
         </div>
         {sev && <div className="severity-badge" style={{ background: sev.color, marginLeft: "auto", flexShrink: 0 }}>{t(sev.bn, sev.en)}</div>}
       </div>
-      {alert.snapshot_b64 && (
+      {detail.snapshot_b64 && (
         <div className="snapshot-container">
-          <img src={`data:image/jpeg;base64,${alert.snapshot_b64}`} alt="Alert snapshot" className="snapshot-img" />
+          <img src={`data:image/jpeg;base64,${detail.snapshot_b64}`} alt="Alert snapshot" className="snapshot-img" />
         </div>
       )}
       <div className="detail-info">
         <div className="info-row"><span>{t("আস্থা","Confidence")}</span><strong>{(alert.confidence * 100).toFixed(1)}%</strong></div>
         <div className="info-row"><span>{t("তীব্রতা","Severity")}</span><strong>L{alert.severity} — {sev?.en}</strong></div>
+        <div className="info-row"><span>{t("অবস্থা","Status")}</span><strong>{detail.status || alert.status}</strong></div>
+        {detail.assigned_to && <div className="info-row"><span>{t("নিযুক্ত","Assigned")}</span><strong>{detail.assigned_to}</strong></div>}
         {alert.metadata?.vehicle_class && <div className="info-row"><span>{t("যানবাহন","Vehicle")}</span><strong>{alert.metadata.vehicle_class}</strong></div>}
         {alert.metadata?.speed_kmh > 0  && <div className="info-row"><span>{t("গতি","Speed")}</span><strong>{alert.metadata.speed_kmh} km/h</strong></div>}
         {alert.metadata?.plate          && <div className="info-row"><span>{t("নম্বর প্লেট","Plate")}</span><strong className="plate-badge">{alert.metadata.plate}</strong></div>}
@@ -808,12 +598,42 @@ function AlertDetail({ alert, language, onBack, onAccept, onReject, onEscalate }
           </div>
         )}
       </div>
-      <div className="ai-disclaimer">⚠ {t("এআই সহায়তা প্রদান করেছে। সিদ্ধান্ত ও দায়িত্ব অফিসারের।","AI assisted only. The decision and responsibility remain with the officer.")}</div>
-      <div className="action-buttons">
-        <button className="btn-accept"   onClick={onAccept}>  {t("গ্রহণ করুন ✓","Accept ✓")}</button>
-        <button className="btn-escalate" onClick={onEscalate}>{t("উর্ধ্বতন ↑",  "Escalate ↑")}</button>
-        <button className="btn-reject"   onClick={onReject}>  {t("বাতিল ✗",      "Reject ✗")}</button>
-      </div>
+      <div className="ai-disclaimer">{t("এআই সহায়তা প্রদান করেছে। সিদ্ধান্ত ও দায়িত্ব অপারেটরের।","AI assisted only. The decision and responsibility remain with the operator.")}</div>
+      {(detail.notes || []).length > 0 && (
+        <div className="alert-notes">
+          {(detail.notes || []).map(n => (
+            <div key={n.id} className="alert-note-item">
+              <span className="alert-note-meta">{n.officer_id || "—"} · {n.created_at ? new Date(n.created_at).toLocaleString() : ""}</span>
+              <div>{n.note}</div>
+            </div>
+          ))}
+        </div>
+      )}
+      {canAct && (
+        <>
+          <div className="alert-note-form">
+            <textarea rows={2} value={note} onChange={e => setNote(e.target.value)}
+              placeholder={t("নোট লিখুন…","Add a note…")} />
+            <button type="button" className="btn-note" onClick={saveNote} disabled={!note.trim()}>
+              {t("নোট","Note")}
+            </button>
+          </div>
+          <div className="alert-assign-row">
+            <input value={assignee} onChange={e => setAssignee(e.target.value)}
+              placeholder={t("অফিসার ID","Officer ID")} />
+            <button type="button" className="btn-lifecycle" onClick={() => onAssign?.(alert.alert_id, assignee)}>
+              {t("নিযুক্ত করুন","Assign")}
+            </button>
+          </div>
+          <div className="action-buttons">
+            <button className="btn-accept"   onClick={onAccept}>  {t("স্বীকার ✓","Acknowledge ✓")}</button>
+            <button className="btn-lifecycle" onClick={() => onInvestigate?.(alert.alert_id)}>{t("তদন্ত","Investigate")}</button>
+            <button className="btn-lifecycle" onClick={() => onResolve?.(alert.alert_id, note)}>{t("সমাধান","Resolve")}</button>
+            <button className="btn-escalate" onClick={onEscalate}>{t("উর্ধ্বতন ↑",  "Escalate ↑")}</button>
+            <button className="btn-reject"   onClick={onReject}>  {t("বাতিল ✗",      "Reject ✗")}</button>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -905,7 +725,7 @@ export function IncidentList({ incidents, language, apiUrl }) {
           <div className="page-sub">{open} {t("খোলা ঘটনা","open incidents")}</div>
         </div>
       </div>
-      {incidents.length === 0 && <div className="empty-state"><span className="empty-icon">📋</span>{t("কোনো ঘটনা নেই","No incidents")}</div>}
+      {incidents.length === 0 && <div className="empty-state"><span className="empty-icon"><IconEmpty /></span>{t("কোনো ঘটনা নেই","No incidents")}</div>}
       {incidents.map(inc => (
         <div key={inc.id} className={`incident-card status-${inc.status}`} onClick={() => openDetail(inc)} style={{ cursor: "pointer" }}>
           <div className="inc-header">
@@ -1128,9 +948,9 @@ export function EvidencePage({ language, apiUrl }) {
           <div className="severity-badge" style={{background:sev?.color}}>L{selected.severity} {sev?.en}</div>
         </div>
         <div className="evidence-detail-meta">
-          <span>📷 {selected.camera_id}</span>
-          <span>📍 {selected.location || "—"}</span>
-          <span>🕐 {new Date(selected.timestamp).toLocaleString()}</span>
+          <span>{selected.camera_id}</span>
+          <span>{selected.location || "—"}</span>
+          <span>{new Date(selected.timestamp).toLocaleString()}</span>
           <span>{t("আস্থা","Conf")}: {(selected.confidence*100).toFixed(1)}%</span>
         </div>
         {selected.snapshot_b64 && (
@@ -1178,7 +998,7 @@ export function EvidencePage({ language, apiUrl }) {
       </div>
       {loading && <div className="analytics-loading">{t("লোড হচ্ছে…","Loading…")}</div>}
       {!loading && evidence.length === 0 && (
-        <div className="empty-state"><span className="empty-icon">🖼️</span>{t("কোনো স্ন্যাপশট পাওয়া যায়নি","No snapshots found")}</div>
+        <div className="empty-state"><span className="empty-icon"><IconEmpty /></span>{t("কোনো স্ন্যাপশট পাওয়া যায়নি","No snapshots found")}</div>
       )}
       <div className="evidence-grid">
         {evidence.map(ev => {
@@ -1187,7 +1007,7 @@ export function EvidencePage({ language, apiUrl }) {
             <div key={ev.alert_id} className="evidence-card" onClick={() => setSelected(ev)}>
               {ev.snapshot_b64
                 ? <img src={`data:image/jpeg;base64,${ev.snapshot_b64}`} alt="evidence" className="evidence-thumb"/>
-                : <div className="evidence-no-img">🖼️</div>
+                : <div className="evidence-no-img"><IconEmpty /></div>
               }
               <div className="evidence-card-info">
                 <div className="evidence-card-type">{ALERT_LABELS[ev.alert_type]?.en ?? ev.alert_type}</div>
@@ -1211,6 +1031,47 @@ export function EvidencePage({ language, apiUrl }) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // ADMIN / SYSTEM HEALTH PAGE
 // ═══════════════════════════════════════════════════════════════════════════════
+function fmtMs(block) {
+  if (!block || block.p50 == null) return "—";
+  const p95 = block.p95 != null ? ` / p95 ${block.p95}` : "";
+  return `p50 ${block.p50}${p95} ms`;
+}
+
+function PerfPanel({ language, health }) {
+  const t = (bn, en) => language === "bn" ? bn : en;
+  const [overlay, setOverlay] = useState(0);
+  useEffect(() => {
+    const iv = setInterval(() => setOverlay(overlayFps()), 1000);
+    return () => clearInterval(iv);
+  }, []);
+  const ai = health.traffic_ai?.perf || {};
+  const alerts = health.alert_service?.perf || {};
+  const ingest = health.video_ingest?.perf || {};
+  const res = ai.resources || ingest.resources || {};
+  const gpu = res.gpu;
+  return (
+    <div className="admin-services">
+      <div className="admin-section-title">{t("পরিমাপ (Phase 6)","Measurement")}</div>
+      <div className="perf-grid">
+        <div className="perf-stat"><span>{t("ক্যামেরা","Cameras")}</span><strong>{ai.camera_count ?? ingest.camera_count ?? "—"}</strong></div>
+        <div className="perf-stat"><span>{t("AI FPS","AI FPS")}</span><strong>{ai.ai_fps_avg ?? "—"}</strong><em>target {ai.target_fps ?? "—"}</em></div>
+        <div className="perf-stat"><span>{t("ইনফারেন্স","Inference")}</span><strong>{fmtMs(ai.inference_latency_ms)}</strong></div>
+        <div className="perf-stat"><span>{t("ইভেন্ট ইনজেস্ট","Event ingest")}</span><strong>{fmtMs(alerts.ingest_latency_ms)}</strong></div>
+        <div className="perf-stat"><span>{t("অ্যালার্ট WS","Alert WS")}</span><strong>{fmtMs(alerts.ws_broadcast_ms)}</strong></div>
+        <div className="perf-stat"><span>{t("ওভারলে FPS","Overlay FPS")}</span><strong>{overlay}</strong></div>
+        <div className="perf-stat"><span>CPU load</span><strong>{res.load1 ?? "—"}</strong><em>RSS {res.rss_mb ?? "—"} MB</em></div>
+        <div className="perf-stat"><span>GPU</span><strong>{gpu ? `${gpu.util_pct}%` : t("নেই / CPU","none / CPU")}</strong><em>{gpu ? `${gpu.mem_used_mb}/${gpu.mem_total_mb} MB` : `batch ${ai.batch_size ?? 1}`}</em></div>
+      </div>
+      <p className="form-hint">
+        {t(
+          "CPU কম্পোজে CAMERA_FPS=10 রাখা হয়েছে। GPU-তে ইনফারেন্স p95 < 50ms হলে বাড়ান। লাইভ ওয়ালের WHEP টাইল ভার্চুয়ালাইজ করা হয় না।",
+          "Compose keeps CAMERA_FPS=10 on CPU. Raise only when GPU inference p95 is under 50ms. Live-wall WHEP tiles are not virtualized."
+        )}
+      </p>
+    </div>
+  );
+}
+
 export function AdminPage({ language, alertApiUrl, videoIngestUrl, trafficAiUrl }) {
   const [health, setHealth] = useState({});
   const t = (bn, en) => language === "bn" ? bn : en;
@@ -1272,6 +1133,8 @@ export function AdminPage({ language, alertApiUrl, videoIngestUrl, trafficAiUrl 
         ))}
       </div>
 
+      <PerfPanel language={language} health={health} />
+
       <div className="admin-info">
         <div className="admin-section-title">{t("সার্ভিস Endpoints","Service Endpoints")}</div>
         <div className="admin-urls">
@@ -1282,6 +1145,10 @@ export function AdminPage({ language, alertApiUrl, videoIngestUrl, trafficAiUrl 
             ["WHEP Streaming", WHEP_BASE],
             ["HLS Streaming",  HLS_BASE],
             ["Detection WS",   `${TRAFFIC_AI_WS}/detections/{cam}/ws`],
+            ["Counts",         `${trafficAiUrl}/counts/{cam}`],
+            ["Zones",          `${videoIngestUrl}/cameras/{cam}/zones`],
+            ["Events",         `${alertApiUrl}/events`],
+            ["AI rules",       `${alertApiUrl}/rules`],
           ].map(([label, url]) => (
             <div key={label} className="admin-url-row">
               <span className="admin-url-label">{label}</span>
