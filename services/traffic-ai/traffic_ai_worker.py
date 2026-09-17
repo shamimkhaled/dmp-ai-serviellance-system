@@ -27,7 +27,8 @@ Environment variables (all required paths / thresholds):
   TRAFFIC_CONF_THRESHOLD    0.45
   TRAFFIC_NMS_IOU           0.45
   SPEED_ALERT_THRESHOLD     60
-  CAMERA_FPS                15
+  CAMERA_FPS                10
+  DET_WS_COALESCE_MS        150  (latest-wins overlay WS; 0 = every frame)
   BATCH_SIZE                4
   ZONE_REFRESH_INTERVAL     300
   CAMERA_REFRESH_INTERVAL   60
@@ -77,6 +78,10 @@ from prometheus_client import (
 )
 
 load_dotenv()
+
+AUTH_MODE = os.getenv("AUTH_MODE", "off").strip().lower()
+AUTH_VERIFY_URL = os.getenv("AUTH_VERIFY_URL", "http://alert-service:8004/auth/verify")
+_AUTH_PUBLIC = {"/health", "/metrics"}
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 def configure_logging(level: str = "INFO") -> None:
@@ -131,6 +136,7 @@ class Settings:
     warmup_iters: int
     anpr_enabled: bool
     preview_enabled: bool
+    det_ws_coalesce_ms: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -149,7 +155,7 @@ class Settings:
             conf_threshold      = float(os.getenv("TRAFFIC_CONF_THRESHOLD", "0.45")),
             nms_iou             = float(os.getenv("TRAFFIC_NMS_IOU",         "0.45")),
             speed_alert_kmh     = float(os.getenv("SPEED_ALERT_THRESHOLD",   "60")),
-            camera_fps          = int(os.getenv("CAMERA_FPS", "15")),
+            camera_fps          = int(os.getenv("CAMERA_FPS", "10")),
             batch_size          = int(os.getenv("BATCH_SIZE", "4")) if use_gpu else 1,
             zone_refresh_s      = int(os.getenv("ZONE_REFRESH_INTERVAL", "300")),
             camera_refresh_s    = int(os.getenv("CAMERA_REFRESH_INTERVAL", "60")),
@@ -163,6 +169,7 @@ class Settings:
             warmup_iters        = int(os.getenv("MODEL_WARMUP_ITERS", "10")),
             anpr_enabled        = os.getenv("ANPR_ENABLED", "true").lower() == "true",
             preview_enabled     = os.getenv("PREVIEW_ENABLED", "true").lower() == "true",
+            det_ws_coalesce_ms  = max(0, int(os.getenv("DET_WS_COALESCE_MS", "150"))),
         )
 
 
@@ -179,10 +186,62 @@ ERRORS_TOTAL = Counter(
 INFERENCE_LATENCY = Histogram(
     "traffic_inference_latency_ms",
     "Full detect→publish latency (ms)",
-    buckets=[5, 10, 25, 50, 100, 200, 500, 1000],
+    buckets=[5, 10, 25, 50, 100, 200, 500, 1000, 2000],
 )
 FPS_GAUGE = Gauge("traffic_fps", "Frames processed per second", ["camera_id"])
 QUEUE_DEPTH = Gauge("traffic_queue_depth", "Unprocessed frames in queue")
+STALE_DROPPED = Counter(
+    "traffic_stale_frames_total", "Frames dropped because a newer frame arrived", ["camera_id"]
+)
+
+_nvml_ready: bool | None = None
+
+
+def _percentile(values: list[float], p: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round((p / 100.0) * (len(ordered) - 1)))))
+    return round(ordered[idx], 1)
+
+
+def _resource_snapshot() -> dict:
+    """Cheap process/host snapshot for /health. GPU is optional (pynvml)."""
+    global _nvml_ready
+    out: dict[str, Any] = {
+        "cpu_count": os.cpu_count(),
+        "load1": None,
+        "rss_mb": None,
+        "gpu": None,
+    }
+    try:
+        out["load1"] = round(os.getloadavg()[0], 2)
+    except Exception:
+        pass
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as fh:
+            pages = int(fh.read().split()[1])
+        out["rss_mb"] = round(pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024), 1)
+    except Exception:
+        pass
+    if _nvml_ready is False:
+        return out
+    try:
+        import pynvml
+        if _nvml_ready is None:
+            pynvml.nvmlInit()
+            _nvml_ready = True
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        out["gpu"] = {
+            "util_pct": int(util.gpu),
+            "mem_used_mb": round(mem.used / (1024 * 1024)),
+            "mem_total_mb": round(mem.total / (1024 * 1024)),
+        }
+    except Exception:
+        _nvml_ready = False
+    return out
 
 # ── Class maps ────────────────────────────────────────────────────────────────
 # Full COCO 80-class map — used for detection overlay on all objects.
@@ -241,9 +300,16 @@ SEVERITY_MAP: dict[str, int] = {
     "helmet_missing":       2,
     "illegal_parking":      2,
     "speeding":             3,
+    "restricted_area":      3,
 }
 
 BD_PLATE_RE = re.compile(r"[A-Z]{2,3}[\s-]?\d{2}[\s-]?\d{4,5}")
+
+
+def _clamp_inference_fps(value: int | None, default: int) -> int:
+    """Inference FPS is configurable; default comes from CAMERA_FPS. Clamp 1–25."""
+    src = default if value is None else int(value)
+    return max(1, min(25, src))
 
 
 # ── Domain types ──────────────────────────────────────────────────────────────
@@ -256,12 +322,15 @@ class Detection:
     frame_id:    int
     camera_id:   str
     timestamp_ms: int
+    track_id:    int | None = None
+    zone_id:     str | None = None
+    attributes:  dict = field(default_factory=dict)
 
 
 @dataclass
 class Zone:
     zone_id:           str
-    zone_type:         str   # red_light|stop_line|wrong_lane|no_parking|speed
+    zone_type:         str   # red_light|stop_line|wrong_lane|no_parking|speed|restricted|counting_line|detection
     polygon_pts:       list[tuple[float, float]] | None   # normalised 0-1 coords
     stop_line_y:       float | None
     lane_pts:          list[tuple[float, float]] | None
@@ -282,6 +351,11 @@ class TrackState:
     violation_flags:    set[str] = field(default_factory=set)
     last_frame_seq:     int = 0
     lane_cross_count:   int = 0
+    line_side:          dict[str, int] = field(default_factory=dict)
+    zone_entered_ms:    dict[str, int] = field(default_factory=dict)
+    dwell_ms:           dict[str, int] = field(default_factory=dict)
+    inside_zones:       set[str] = field(default_factory=set)
+    last_cross_ms:      dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -606,6 +680,8 @@ class ViolationAnalyzer:
         self._track_states: dict[str, dict[int, TrackState]] = {}
         self._last_zone_load: float = 0.0
         self._pool: asyncpg.Pool | None = None
+        self._camera_fps: dict[str, int] = {}
+        self._line_counts: dict[str, dict[str, int]] = {}
 
     async def connect(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
@@ -622,7 +698,8 @@ class ViolationAnalyzer:
                 zone_type            VARCHAR(30) NOT NULL
                                      CHECK (zone_type IN (
                                        'red_light','stop_line','wrong_lane',
-                                       'no_parking','speed','detection'
+                                       'no_parking','speed','detection',
+                                       'restricted','counting_line'
                                      )),
                 zone_name            VARCHAR(100),
                 polygon_points_json  JSONB,
@@ -639,6 +716,35 @@ class ViolationAnalyzer:
         await self._pool.execute(
             "CREATE INDEX IF NOT EXISTS camera_zones_cam_idx ON camera_zones(camera_id)"
         )
+        try:
+            await self._pool.execute(
+                """
+                DO $$
+                DECLARE r RECORD;
+                BEGIN
+                  FOR r IN
+                    SELECT c.conname
+                    FROM pg_constraint c
+                    JOIN pg_class t ON c.conrelid = t.oid
+                    WHERE t.relname = 'camera_zones' AND c.contype = 'c'
+                      AND pg_get_constraintdef(c.oid) ILIKE '%zone_type%'
+                  LOOP
+                    EXECUTE format('ALTER TABLE camera_zones DROP CONSTRAINT %I', r.conname);
+                  END LOOP;
+                END $$
+                """
+            )
+            await self._pool.execute(
+                """
+                ALTER TABLE camera_zones ADD CONSTRAINT camera_zones_zone_type_check
+                  CHECK (zone_type IN (
+                    'red_light','stop_line','wrong_lane','no_parking','speed',
+                    'detection','restricted','counting_line'
+                  ))
+                """
+            )
+        except Exception as exc:
+            log.warning("zone_type_constraint_skip", error=str(exc))
 
     async def _load_zones(self) -> None:
         if not self._pool:
@@ -718,6 +824,8 @@ class ViolationAnalyzer:
             else:
                 state.stationary_frames = 0
 
+            self._update_dwell(zones, state, cx, cy, timestamp_ms)
+
             for zone in zones:
                 v = self._check_zone(camera_id, zone, track, state, displacement, timestamp_ms, frame_seq)
                 if v:
@@ -748,6 +856,10 @@ class ViolationAnalyzer:
             return self._parking(camera_id, zone, track, state, timestamp_ms, frame_seq)
         if ztype == "speed":
             return self._speed(camera_id, zone, track, state, displacement, timestamp_ms, frame_seq)
+        if ztype == "restricted":
+            return self._restricted(camera_id, zone, track, state, timestamp_ms, frame_seq)
+        if ztype == "counting_line":
+            return self._counting_line(camera_id, zone, track, state, displacement, timestamp_ms, frame_seq)
         return None
 
     def _in_polygon(self, pt: tuple[float, float], scaled_pts: list[tuple]) -> bool:
@@ -869,8 +981,8 @@ class ViolationAnalyzer:
         cx, cy = self._centroid(track["bbox_xyxy"])
         if not self._in_polygon((cx, cy), self._scale(zone.polygon_pts)):
             return None
-        # 30 s stationary at 15 fps = 450 frames
-        threshold = int(30 * self._s.camera_fps)
+        # 30 s stationary at configured inference FPS
+        threshold = int(30 * self.fps_for(camera_id))
         if state.stationary_frames < threshold:
             return None
         key = f"parking_{zone.zone_id}"
@@ -894,7 +1006,7 @@ class ViolationAnalyzer:
         ppm = zone.speed_cal_ppm
         if ppm <= 0:
             return None
-        speed_kmh = (displacement * self._s.camera_fps * 3.6) / ppm
+        speed_kmh = (displacement * self.fps_for(camera_id) * 3.6) / ppm
         limit = zone.speed_limit_kmh or self._s.speed_alert_kmh
         if speed_kmh <= limit:
             return None
@@ -933,6 +1045,135 @@ class ViolationAnalyzer:
         brightness = (b + g + r) / 3
         # Very dark head region suggests bare head (hair) vs bright region (helmet)
         return brightness < 40.0
+
+    def fps_for(self, camera_id: str) -> int:
+        return _clamp_inference_fps(self._camera_fps.get(camera_id), self._s.camera_fps)
+
+    def _update_dwell(
+        self,
+        zones: list[Zone],
+        state: TrackState,
+        cx: float,
+        cy: float,
+        timestamp_ms: int,
+    ) -> None:
+        inside: set[str] = set()
+        for zone in zones:
+            if not zone.polygon_pts or len(zone.polygon_pts) < 3:
+                continue
+            if not self._in_polygon((cx, cy), self._scale(zone.polygon_pts)):
+                continue
+            inside.add(zone.zone_id)
+            if zone.zone_id not in state.zone_entered_ms:
+                state.zone_entered_ms[zone.zone_id] = timestamp_ms
+            state.dwell_ms[zone.zone_id] = max(
+                0, timestamp_ms - state.zone_entered_ms[zone.zone_id]
+            )
+        left = state.inside_zones - inside
+        for zid in left:
+            state.zone_entered_ms.pop(zid, None)
+            state.dwell_ms.pop(zid, None)
+        state.inside_zones = inside
+
+    def _line_side(self, pt: tuple[float, float], line: list[tuple[float, float]]) -> int:
+        (x1, y1), (x2, y2) = line[0], line[1]
+        cross = (x2 - x1) * (pt[1] - y1) - (y2 - y1) * (pt[0] - x1)
+        if abs(cross) < 4.0:
+            return 0
+        return 1 if cross > 0 else -1
+
+    def _restricted(self, camera_id, zone, track, state, ts, seq) -> ViolationResult | None:
+        if not zone.polygon_pts or len(zone.polygon_pts) < 3:
+            return None
+        cx, cy = self._centroid(track["bbox_xyxy"])
+        if not self._in_polygon((cx, cy), self._scale(zone.polygon_pts)):
+            return None
+        key = f"restricted_{zone.zone_id}"
+        if key in state.violation_flags:
+            return None
+        state.violation_flags.add(key)
+        return ViolationResult(
+            alert_type   = "restricted_area",
+            track_id     = state.track_id,
+            class_name   = state.class_name,
+            confidence   = 0.80,
+            bbox_xyxy    = track["bbox_xyxy"],
+            zone_id      = zone.zone_id,
+            zone_type    = zone.zone_type,
+            camera_id    = camera_id,
+            timestamp_ms = ts,
+            frame_seq    = seq,
+        )
+
+    def _counting_line(self, camera_id, zone, track, state, displacement, ts, seq) -> ViolationResult | None:
+        """Count unique track_id crossings. Does not publish an alert (Phase 3 events)."""
+        if not zone.lane_pts or len(zone.lane_pts) < 2:
+            return None
+        if displacement < 2.0:
+            return None
+        positions = list(state.positions)
+        if len(positions) < 2:
+            return None
+        scaled = self._scale(list(zone.lane_pts)[:2])
+        prev_side = self._line_side(positions[-2], scaled)
+        curr_side = self._line_side(positions[-1], scaled)
+        state.line_side[zone.zone_id] = curr_side
+        if prev_side == 0 or curr_side == 0 or prev_side == curr_side:
+            return None
+        last_ms = state.last_cross_ms.get(zone.zone_id, 0)
+        if ts - last_ms < 400:
+            return None
+        state.last_cross_ms[zone.zone_id] = ts
+        entered = curr_side > 0
+        if zone.camera_direction == "up":
+            entered = curr_side < 0
+        counts = self._line_counts.setdefault(camera_id, {"entered": 0, "exited": 0})
+        if entered:
+            counts["entered"] += 1
+        else:
+            counts["exited"] += 1
+        log.debug(
+            "line_crossed",
+            camera_id=camera_id,
+            zone_id=zone.zone_id,
+            track_id=state.track_id,
+            class_name=state.class_name,
+            direction="enter" if entered else "exit",
+        )
+        return None
+
+    def get_counts(self, camera_id: str, tracks: list[dict] | None = None) -> dict:
+        by_class: dict[str, int] = {}
+        for t in tracks or []:
+            name = t.get("class_name") or "unknown"
+            by_class[name] = by_class.get(name, 0) + 1
+        lc = self._line_counts.get(camera_id) or {"entered": 0, "exited": 0}
+        entered = int(lc.get("entered", 0))
+        exited = int(lc.get("exited", 0))
+        return {
+            "current_by_class": by_class,
+            "entered": entered,
+            "exited": exited,
+            "occupancy": max(0, entered - exited),
+        }
+
+    def track_overlay(self, camera_id: str, track: dict) -> tuple[str | None, dict]:
+        state = self._track_states.get(camera_id, {}).get(track["track_id"])
+        if not state or not state.inside_zones:
+            return None, {}
+        zmap = {z.zone_id: z for z in self._zones.get(camera_id, [])}
+        zone_id = None
+        attrs: dict = {}
+        for zid in state.inside_zones:
+            z = zmap.get(zid)
+            if z and z.zone_type == "restricted":
+                zone_id = zid
+                attrs["inside_restricted"] = True
+                break
+        if zone_id is None:
+            zone_id = next(iter(state.inside_zones))
+        attrs["dwell_ms"] = int(state.dwell_ms.get(zone_id, 0))
+        return zone_id, attrs
 
     def _prune(self, camera_id: str, frame_seq: int, max_age: int = 60) -> None:
         cam = self._track_states.get(camera_id, {})
@@ -1102,14 +1343,19 @@ class AlertPublisher:
 
         metadata = {
             "track_id":        violation.track_id,
+            "object_type":     violation.class_name,
             "vehicle_class":   violation.class_name,
+            "zone_id":         violation.zone_id,
+            "zone_type":       violation.zone_type,
             "violation_zone":  violation.zone_id,
+            "bbox":            [int(v) for v in violation.bbox_xyxy],
             "speed_kmh":       violation.speed_kmh,
             "plate_text":      plate_text,
             "plate_confidence": round(plate_conf, 3),
             "frame_seq":       violation.frame_seq,
         }
 
+        # severity is ignored by alert-service rules; kept for stream compatibility
         payload = {
             "alert_id":        str(uuid.uuid4()),
             "alert_type":      violation.alert_type,
@@ -1186,6 +1432,8 @@ class TrafficWorker:
         self._anpr:        ANPRReader | None         = None
         self._publisher:   AlertPublisher | None      = None
         self._cameras:     list[str]  = list(settings.camera_ids_fallback)
+        self._camera_fps:  dict[str, int] = {}
+        self._reader_fps:  dict[str, int] = {}
         self._fps_windows: dict[str, deque] = {}
         # Latest annotated JPEG per camera, served by the /preview MJPEG endpoint.
         self._latest_jpeg: dict[str, bytes] = {}
@@ -1194,6 +1442,12 @@ class TrafficWorker:
         self._motion_skip_count: dict[str, int]  = {}   # consecutive no-motion frames
         # Latest serialised detection list per camera, broadcast to WS clients
         self._latest_detections: dict[str, list] = {}
+        self._latest_det_payload: dict[str, dict] = {}
+        self._pending_frames: dict[str, dict] = {}
+        self._pending_event: asyncio.Event | None = None
+        self._latency_ms: deque[float] = deque(maxlen=200)
+        self._ws_last_sent: dict[str, float] = {}
+        self._ws_flush_task: dict[str, asyncio.Task] = {}
         self._stats = {
             "frames_processed":   0,
             "alerts_generated":   0,
@@ -1202,6 +1456,7 @@ class TrafficWorker:
             "use_gpu":            settings.use_gpu,
             "frame_source":       settings.frame_source,
             "motion_skipped":     0,
+            "frames_dropped_stale": 0,
         }
 
     async def start(self) -> None:
@@ -1259,17 +1514,26 @@ class TrafficWorker:
             log.warning("anpr_background_load_failed", error=str(exc))
 
     async def _load_cameras(self) -> None:
-        if not self._pool:
-            return
-        try:
-            rows = await self._pool.fetch(
-                "SELECT camera_id FROM cameras WHERE active=TRUE ORDER BY camera_id"
-            )
-            if rows:
-                self._cameras = [r["camera_id"] for r in rows]
-                self._stats["cameras"] = self._cameras
-        except Exception as exc:
-            log.warning("camera_list_load_failed", error=str(exc))
+        default_fps = _clamp_inference_fps(None, self._s.camera_fps)
+        if self._pool:
+            try:
+                try:
+                    rows = await self._pool.fetch(
+                        "SELECT camera_id, inference_fps FROM cameras "
+                        "WHERE active=TRUE ORDER BY camera_id"
+                    )
+                except Exception:
+                    rows = await self._pool.fetch(
+                        "SELECT camera_id FROM cameras WHERE active=TRUE ORDER BY camera_id"
+                    )
+                if rows:
+                    self._cameras = [r["camera_id"] for r in rows]
+                    self._stats["cameras"] = self._cameras
+                    for r in rows:
+                        inf = r["inference_fps"] if "inference_fps" in r.keys() else None
+                        self._camera_fps[r["camera_id"]] = _clamp_inference_fps(inf, default_fps)
+            except Exception as exc:
+                log.warning("camera_list_load_failed", error=str(exc))
 
         # Also try video-ingest API
         try:
@@ -1277,27 +1541,109 @@ class TrafficWorker:
                 resp = await client.get(f"{self._s.video_ingest_url}/cameras")
                 if resp.status_code == 200:
                     data = resp.json()
-                    ids = [c["camera_id"] for c in data if c.get("streaming")]
+                    ids = []
+                    for c in data:
+                        if not c.get("streaming"):
+                            continue
+                        cid = c["camera_id"]
+                        ids.append(cid)
+                        if c.get("inference_fps"):
+                            self._camera_fps[cid] = _clamp_inference_fps(
+                                c.get("inference_fps"), default_fps
+                            )
+                        elif cid not in self._camera_fps:
+                            self._camera_fps[cid] = default_fps
                     if ids:
                         self._cameras = ids
                         self._stats["cameras"] = ids
         except Exception:
             pass
 
+        if self._analyzer:
+            self._analyzer._camera_fps = dict(self._camera_fps)
+
     async def run(self) -> None:
-        src = self._s.frame_source
-        if src == "queue" and self._frame_queue is not None:
-            await self._run_queue_mode()
-        elif src == "mock" or (src == "rtsp" and not self._cameras):
-            await self._run_mock_mode()
-        else:
-            await self._run_rtsp_mode()
+        self._pending_event = asyncio.Event()
+        infer = asyncio.create_task(self._infer_loop(), name="infer-loop")
+        try:
+            src = self._s.frame_source
+            if src == "queue" and self._frame_queue is not None:
+                await self._run_queue_mode()
+            elif src == "mock" or (src == "rtsp" and not self._cameras):
+                await self._run_mock_mode()
+            else:
+                await self._run_rtsp_mode()
+        finally:
+            infer.cancel()
+            try:
+                await infer
+            except asyncio.CancelledError:
+                pass
+
+    async def _submit_frame(self, meta: dict) -> None:
+        """Keep only the latest unread frame per camera (drop stale)."""
+        cam = meta["camera_id"]
+        if cam in self._pending_frames:
+            self._stats["frames_dropped_stale"] += 1
+            STALE_DROPPED.labels(camera_id=cam).inc()
+        self._pending_frames[cam] = meta
+        QUEUE_DEPTH.set(len(self._pending_frames))
+        if self._pending_event is not None:
+            self._pending_event.set()
+
+    async def _infer_loop(self) -> None:
+        """Single inference worker: batches GPU frames, latest-wins on CPU."""
+        gather_s = 0.025 if self._s.batch_size > 1 else 0.0
+        while not self._stop_event.is_set():
+            if not self._pending_frames:
+                if self._pending_event is not None:
+                    try:
+                        await asyncio.wait_for(self._pending_event.wait(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        continue
+                    self._pending_event.clear()
+                else:
+                    await asyncio.sleep(0.05)
+                    continue
+                if not self._pending_frames:
+                    continue
+            if gather_s and len(self._pending_frames) < self._s.batch_size:
+                await asyncio.sleep(gather_s)
+            batch: list[dict] = []
+            for cam in list(self._pending_frames.keys())[: self._s.batch_size]:
+                batch.append(self._pending_frames.pop(cam))
+            QUEUE_DEPTH.set(len(self._pending_frames))
+            if batch:
+                await self._process_batch(batch)
+
+    def perf_snapshot(self) -> dict:
+        lat = list(self._latency_ms)
+        fps = {cid: float(len(win)) for cid, win in self._fps_windows.items()}
+        avg = round(sum(fps.values()) / len(fps), 2) if fps else 0.0
+        return {
+            "camera_count": len(self._cameras),
+            "ai_fps": fps,
+            "ai_fps_avg": avg,
+            "target_fps": self._s.camera_fps,
+            "batch_size": self._s.batch_size,
+            "inference_latency_ms": {
+                "p50": _percentile(lat, 50),
+                "p95": _percentile(lat, 95),
+                "last": round(lat[-1], 1) if lat else None,
+            },
+            "queue_depth": len(self._pending_frames),
+            "ws_subscribers": {
+                k: len(v) for k, v in detection_subscribers.items() if v
+            },
+            "ws_coalesce_ms": self._s.det_ws_coalesce_ms,
+            "resources": _resource_snapshot(),
+            "frames_dropped_stale": self._stats.get("frames_dropped_stale", 0),
+        }
 
     # ── Queue mode ────────────────────────────────────────────────────────────
     async def _run_queue_mode(self) -> None:
         log.info("frame_source_queue")
         loop = asyncio.get_running_loop()
-        batch: list[dict] = []
         last_refresh = time.monotonic()
 
         while not self._stop_event.is_set():
@@ -1305,18 +1651,13 @@ class TrafficWorker:
                 msg = await loop.run_in_executor(
                     None, self._frame_queue.get, True, 0.1
                 )
-                batch.append(msg)
-                QUEUE_DEPTH.set(self._frame_queue.qsize())
+                await self._submit_frame(msg)
+                QUEUE_DEPTH.set(len(self._pending_frames))
             except Empty:
                 pass
             except Exception as exc:
                 log.warning("queue_read_error", error=str(exc))
 
-            if len(batch) >= self._s.batch_size or (batch and len(batch) >= 1):
-                await self._process_batch(batch)
-                batch = []
-
-            # Periodic refreshes
             if time.monotonic() - last_refresh > min(self._s.zone_refresh_s, 60):
                 await self._analyzer.maybe_refresh()
                 await self._load_cameras()
@@ -1331,11 +1672,16 @@ class TrafficWorker:
         last_refresh = time.monotonic()
 
         while not self._stop_event.is_set():
-            # Start tasks for new cameras
+            # Start tasks for new cameras; restart if inference FPS changed
             for cam_id in self._cameras:
+                want_fps = self._camera_fps.get(cam_id) or _clamp_inference_fps(None, self._s.camera_fps)
+                existing = cam_tasks.get(cam_id)
+                if existing and not existing.done() and self._reader_fps.get(cam_id) != want_fps:
+                    existing.cancel()
                 if cam_id not in cam_tasks or cam_tasks[cam_id].done():
+                    self._reader_fps[cam_id] = want_fps
                     cam_tasks[cam_id] = asyncio.create_task(
-                        self._rtsp_reader(cam_id), name=f"rtsp-{cam_id}"
+                        self._rtsp_reader(cam_id, want_fps), name=f"rtsp-{cam_id}"
                     )
 
             # Cancel tasks for removed cameras
@@ -1353,7 +1699,7 @@ class TrafficWorker:
 
             await asyncio.sleep(self._s.camera_refresh_s)
 
-    async def _rtsp_reader(self, camera_id: str) -> None:
+    async def _rtsp_reader(self, camera_id: str, target_fps: int | None = None) -> None:
         """Read RTSP stream for one camera and feed frames into the pipeline."""
         import importlib.util
         spec = importlib.util.find_spec("video_ingest")
@@ -1364,9 +1710,10 @@ class TrafficWorker:
             # Inline minimal FrameStream if video_ingest not on path
             FrameStream = _LocalFrameStream  # type: ignore
 
+        fps = _clamp_inference_fps(target_fps, self._s.camera_fps)
         rtsp_url = f"{self._s.rtsp_base_url}/{camera_id}"
-        log.info("rtsp_reader_start", camera_id=camera_id, url=rtsp_url)
-        stream = FrameStream(rtsp_url, target_fps=self._s.camera_fps)
+        log.info("rtsp_reader_start", camera_id=camera_id, url=rtsp_url, inference_fps=fps)
+        stream = FrameStream(rtsp_url, target_fps=fps)
         frame_seq = 0
 
         try:
@@ -1381,7 +1728,7 @@ class TrafficWorker:
                     "frame":        frame_640,
                 }
                 frame_seq += 1
-                await self._process_batch([meta])
+                await self._submit_frame(meta)
         except asyncio.CancelledError:
             log.info("rtsp_reader_cancelled", camera_id=camera_id)
         except Exception as exc:
@@ -1530,6 +1877,7 @@ class TrafficWorker:
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         INFERENCE_LATENCY.observe(elapsed_ms)
+        self._latency_ms.append(elapsed_ms)
 
     async def _process_single(
         self,
@@ -1611,15 +1959,13 @@ class TrafficWorker:
 
         # Broadcast structured detection data to WebSocket subscribers so the
         # dashboard can render canvas overlays on the live low-latency stream.
-        if detection_subscribers.get(camera_id):
-            try:
-                payload = self._build_det_payload(camera_id, dets, tracks, violations, frame)
-                self._latest_detections[camera_id] = payload["detections"]
-                asyncio.create_task(
-                    self._broadcast_detections_ws(camera_id, json.dumps(payload))
-                )
-            except Exception as exc:
-                log.debug("ws_broadcast_failed", camera_id=camera_id, error=str(exc))
+        try:
+            payload = self._build_det_payload(camera_id, dets, tracks, violations, frame, ts_ms)
+            self._latest_detections[camera_id] = payload["detections"]
+            self._latest_det_payload[camera_id] = payload
+            self._schedule_det_ws(camera_id, payload)
+        except Exception as exc:
+            log.debug("ws_broadcast_failed", camera_id=camera_id, error=str(exc))
 
     def _annotate(
         self,
@@ -1728,54 +2074,122 @@ class TrafficWorker:
         tracks:     list,
         violations: list,
         frame:      np.ndarray,
+        timestamp_ms: int | None = None,
     ) -> dict:
         """Serialise detections + tracks into a JSON-safe dict for WS clients."""
         viol_map: dict[int, str] = {v.track_id: v.alert_type for v in violations}
+        viol_zone: dict[int, str] = {v.track_id: v.zone_id for v in violations if v.zone_id}
+        ts = int(timestamp_ms or time.time() * 1000)
         items: list[dict] = []
+
+        def _item(
+            *,
+            bbox: list[int],
+            class_name: str,
+            track_id: int | None,
+            confidence: float,
+            violation: str | None,
+            zone_id: str | None = None,
+            attributes: dict | None = None,
+        ) -> dict:
+            return {
+                "camera_id":    camera_id,
+                "timestamp_ms": ts,
+                "object_type":  class_name,
+                "class":        class_name,
+                "track_id":     track_id,
+                "confidence":   round(float(confidence), 2),
+                "bbox":         bbox,
+                "zone_id":      zone_id,
+                "attributes":   attributes or {},
+                "violation":    violation,
+            }
 
         if tracks:
             for tk in tracks:
                 x1, y1, x2, y2 = [int(v) for v in tk["bbox_xyxy"]]
-                items.append({
-                    "bbox":       [x1, y1, x2, y2],
-                    "class":      tk["class_name"],
-                    "track_id":   tk["track_id"],
-                    "confidence": round(float(tk.get("confidence", 0.8)), 2),
-                    "violation":  viol_map.get(tk["track_id"]),
-                })
-            # Non-vehicle detections not handled by DeepSORT
+                zone_id, attrs = (None, {})
+                if self._analyzer:
+                    zone_id, attrs = self._analyzer.track_overlay(camera_id, tk)
+                zone_id = viol_zone.get(tk["track_id"], zone_id)
+                items.append(_item(
+                    bbox=[x1, y1, x2, y2],
+                    class_name=tk["class_name"],
+                    track_id=tk["track_id"],
+                    confidence=float(tk.get("confidence", 0.8)),
+                    violation=viol_map.get(tk["track_id"]),
+                    zone_id=zone_id,
+                    attributes=attrs,
+                ))
             tracked_cls = {c for c in VIOLATION_CLASSES}
             for d in dets:
                 if d.class_id in tracked_cls:
                     continue
                 x1, y1, x2, y2 = [int(v) for v in d.bbox_xyxy]
-                items.append({
-                    "bbox":       [x1, y1, x2, y2],
-                    "class":      d.class_name,
-                    "track_id":   None,
-                    "confidence": round(float(d.confidence), 2),
-                    "violation":  None,
-                })
+                items.append(_item(
+                    bbox=[x1, y1, x2, y2],
+                    class_name=d.class_name,
+                    track_id=None,
+                    confidence=float(d.confidence),
+                    violation=None,
+                ))
         else:
             for d in dets:
                 x1, y1, x2, y2 = [int(v) for v in d.bbox_xyxy]
-                items.append({
-                    "bbox":       [x1, y1, x2, y2],
-                    "class":      d.class_name,
-                    "track_id":   None,
-                    "confidence": round(float(d.confidence), 2),
-                    "violation":  None,
-                })
+                items.append(_item(
+                    bbox=[x1, y1, x2, y2],
+                    class_name=d.class_name,
+                    track_id=None,
+                    confidence=float(d.confidence),
+                    violation=None,
+                ))
+
+        counts = self._analyzer.get_counts(camera_id, tracks) if self._analyzer else {
+            "current_by_class": {},
+            "entered": 0,
+            "exited": 0,
+            "occupancy": 0,
+        }
 
         return {
-            "type":        "detections",
-            "camera_id":   camera_id,
-            "ts":          int(time.time() * 1000),
-            "frame_w":     frame.shape[1],
-            "frame_h":     frame.shape[0],
-            "detections":  items,
+            "type":         "detections",
+            "camera_id":    camera_id,
+            "ts":           ts,
+            "frame_w":      frame.shape[1],
+            "frame_h":      frame.shape[0],
+            "detections":   items,
             "object_count": len(items),
+            "counts":       counts,
+            "inference_fps": self._camera_fps.get(camera_id) or _clamp_inference_fps(None, self._s.camera_fps),
         }
+
+    def _schedule_det_ws(self, camera_id: str, payload: dict) -> None:
+        """Latest-wins overlay WS. Default 150ms so 10 FPS inference does not flood the browser."""
+        if not detection_subscribers.get(camera_id):
+            return
+        wait = self._s.det_ws_coalesce_ms / 1000.0
+        now = time.monotonic()
+        last = self._ws_last_sent.get(camera_id, 0.0)
+        if wait <= 0 or now - last >= wait:
+            self._ws_last_sent[camera_id] = now
+            asyncio.create_task(
+                self._broadcast_detections_ws(camera_id, json.dumps(payload))
+            )
+            return
+        existing = self._ws_flush_task.get(camera_id)
+        if existing and not existing.done():
+            return
+        delay = max(0.0, wait - (now - last))
+        self._ws_flush_task[camera_id] = asyncio.create_task(
+            self._flush_det_ws_later(camera_id, delay)
+        )
+
+    async def _flush_det_ws_later(self, camera_id: str, delay: float) -> None:
+        await asyncio.sleep(delay)
+        payload = self._latest_det_payload.get(camera_id)
+        if payload and detection_subscribers.get(camera_id):
+            self._ws_last_sent[camera_id] = time.monotonic()
+            await self._broadcast_detections_ws(camera_id, json.dumps(payload))
 
     async def _broadcast_detections_ws(self, camera_id: str, payload_str: str) -> None:
         """Fire-and-forget send to all WebSocket subscribers for this camera."""
@@ -1793,7 +2207,7 @@ class TrafficWorker:
 
 # ── Inline FrameStream (fallback when video_ingest not on path) ───────────────
 class _LocalFrameStream:
-    def __init__(self, rtsp_url: str, target_fps: int = 15) -> None:
+    def __init__(self, rtsp_url: str, target_fps: int = 10) -> None:
         self.rtsp_url   = rtsp_url
         self._interval  = 1.0 / max(1, min(target_fps, 25))
 
@@ -1838,7 +2252,8 @@ detection_subscribers: dict[str, set] = {}
 
 async def _health_handler(_: web.Request) -> web.Response:
     stats = _worker_ref._stats if _worker_ref else {}
-    return web.json_response({"status": "ok", "service": "traffic-ai", **stats})
+    perf = _worker_ref.perf_snapshot() if _worker_ref else {}
+    return web.json_response({"status": "ok", "service": "traffic-ai", **stats, "perf": perf})
 
 
 async def _metrics_handler(_: web.Request) -> web.Response:
@@ -1923,13 +2338,16 @@ async def _detection_ws_handler(request: web.Request) -> web.WebSocketResponse:
     {
       "type":        "detections",
       "camera_id":   "cam01",
-      "ts":          1718000000000,   // epoch ms
-      "frame_w":     1280,
-      "frame_h":     720,
+      "ts":          1718000000000,
+      "frame_w":     640,
+      "frame_h":     640,
       "object_count": 3,
+      "counts":      {"current_by_class": {"person": 2}, "entered": 4, "exited": 1, "occupancy": 3},
       "detections":  [
-        {"bbox": [x1,y1,x2,y2], "class": "car", "track_id": 42,
-         "confidence": 0.87, "violation": "red_light_violation"},
+        {"camera_id": "cam01", "timestamp_ms": ..., "object_type": "car",
+         "class": "car", "track_id": 42, "confidence": 0.87,
+         "bbox": [x1,y1,x2,y2], "zone_id": "...", "attributes": {"dwell_ms": 1200},
+         "violation": "restricted_area"},
         ...
       ]
     }
@@ -1946,17 +2364,9 @@ async def _detection_ws_handler(request: web.Request) -> web.WebSocketResponse:
              subscribers=len(detection_subscribers[cam_id]))
 
     # Send last known detection snapshot immediately on connect
-    if _worker_ref and cam_id in _worker_ref._latest_detections:
+    if _worker_ref and cam_id in _worker_ref._latest_det_payload:
         try:
-            snap = {
-                "type":       "detections",
-                "camera_id":  cam_id,
-                "ts":         int(time.time() * 1000),
-                "frame_w":    640, "frame_h": 360,
-                "detections": _worker_ref._latest_detections[cam_id],
-                "object_count": len(_worker_ref._latest_detections[cam_id]),
-            }
-            await ws.send_str(json.dumps(snap))
+            await ws.send_str(json.dumps(_worker_ref._latest_det_payload[cam_id]))
         except Exception:
             pass
 
@@ -1977,12 +2387,34 @@ async def _detection_ws_handler(request: web.Request) -> web.WebSocketResponse:
 async def _detection_snapshot_handler(request: web.Request) -> web.Response:
     """GET /detections/{camera_id}/latest — latest detections as JSON (no WS needed)."""
     cam_id = request.match_info["camera_id"]
+    if _worker_ref and cam_id in _worker_ref._latest_det_payload:
+        return web.json_response(_worker_ref._latest_det_payload[cam_id])
     dets = _worker_ref._latest_detections.get(cam_id, []) if _worker_ref else []
     return web.json_response({
         "camera_id":   cam_id,
         "ts":          int(time.time() * 1000),
         "detections":  dets,
         "object_count": len(dets),
+        "counts": {
+            "current_by_class": {},
+            "entered": 0,
+            "exited": 0,
+            "occupancy": 0,
+        },
+    })
+
+
+async def _counts_handler(request: web.Request) -> web.Response:
+    """GET /counts/{camera_id} — live class counts and counting-line totals."""
+    cam_id = request.match_info["camera_id"]
+    if not _worker_ref or not _worker_ref._analyzer:
+        return web.json_response({"error": "worker not ready"}, status=503)
+    payload = _worker_ref._latest_det_payload.get(cam_id) or {}
+    counts = payload.get("counts") or _worker_ref._analyzer.get_counts(cam_id)
+    return web.json_response({
+        "camera_id": cam_id,
+        "ts": payload.get("ts") or int(time.time() * 1000),
+        **counts,
     })
 
 
@@ -1999,13 +2431,43 @@ async def _motion_stats_handler(_: web.Request) -> web.Response:
     })
 
 
+async def _auth_ok(request: web.Request) -> bool:
+    if AUTH_MODE not in ("keycloak", "on", "true", "1"):
+        return True
+    if request.path in _AUTH_PUBLIC or request.method == "OPTIONS":
+        return True
+    token = request.headers.get("Authorization") or ""
+    if token.lower().startswith("bearer "):
+        token = token.split(" ", 1)[1].strip()
+    else:
+        token = request.query.get("access_token", "")
+    if not token:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                AUTH_VERIFY_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=3.0,
+            )
+        return r.status_code == 200
+    except Exception as exc:
+        log.warning("auth_verify_failed", error=str(exc))
+        return False
+
+
 async def _start_health_server(port: int) -> web.AppRunner:
     sapp = web.Application()
-    # CORS for dashboard (all origins in dev)
+
     async def _cors(request: web.Request, handler):
-        resp = await handler(request)
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "*"
+        if not await _auth_ok(request):
+            resp = web.json_response({"detail": "Unauthorized"}, status=401)
+        else:
+            resp = await handler(request)
+        origin = request.headers.get("Origin", "*")
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
         return resp
     sapp.middlewares.append(_cors)
 
@@ -2017,6 +2479,7 @@ async def _start_health_server(port: int) -> web.AppRunner:
     # Detection WebSocket and REST snapshot
     sapp.router.add_get("/detections/{camera_id}/ws",     _detection_ws_handler)
     sapp.router.add_get("/detections/{camera_id}/latest", _detection_snapshot_handler)
+    sapp.router.add_get("/counts/{camera_id}",            _counts_handler)
     sapp.router.add_get("/motion/stats", _motion_stats_handler)
 
     runner = web.AppRunner(sapp)

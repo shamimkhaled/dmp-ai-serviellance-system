@@ -96,13 +96,16 @@ will fail to start without it.
 Edit `.env`:
 
 ```
-DATABASE_URL=postgresql://dmp_user:DMPAI2026@103.146.220.225:5432/dmp_db
+DATABASE_URL=postgresql://USER:PASSWORD@DB_HOST:5432/DBNAME
 ```
 
 Before the first start, apply the schema to that database **once**:
 
 ```bash
-psql "postgresql://dmp_user:DMPAI2026@103.146.220.225:5432/dmp_db" -f db/schema.sql
+psql "$DATABASE_URL" -f db/schema.sql
+psql "$DATABASE_URL" -f db/migrations/004_camera_status_zones.sql
+psql "$DATABASE_URL" -f db/migrations/005_inference_fps_zone_types.sql
+psql "$DATABASE_URL" -f db/migrations/006_events_ai_rules.sql
 ```
 
 This requires the `vector` and `uuid-ossp` extensions to be installable on
@@ -119,46 +122,31 @@ don't need to re-run `schema.sql` for small additive changes.
 
 ## 4. Open firewall ports
 
-The stack exposes these ports on the host:
+The stack's browser entry is nginx on port 80. REST APIs bind to `127.0.0.1` and must not be opened on the firewall. WHEP/ICE/HLS and RTSP stay on MediaMTX.
 
-| Port        | Service          | Purpose                              |
-|-------------|------------------|---------------------------------------|
-| 80          | nginx            | Reverse proxy (main entry point)       |
-| 3000        | dashboard        | React dev server (direct access)       |
-| 8001        | video-ingest     | Camera registry API                    |
-| 8002        | traffic-ai       | Traffic AI worker API + preview        |
-| 8003        | face-ai          | Face recognition worker API            |
-| 8004        | alert-service    | Alert REST + WebSocket                 |
-| 8006        | drafting         | GD/FIR drafting service                |
-| 8080        | keycloak         | Auth (RBAC)                            |
-| 8554        | mediamtx         | RTSP ingest                            |
-| 8888        | mediamtx         | HLS playback                           |
-| 8889        | mediamtx         | WebRTC/WHEP signaling                  |
-| 8189 udp/tcp| mediamtx         | WebRTC ICE media — required for video  |
-| 9997        | mediamtx         | MediaMTX API                           |
-| 6379        | redis            | Redis (keep internal-only unless needed)|
+| Port | Bind | Purpose |
+|------|------|---------|
+| 80 | public | nginx — dashboard, `/api`, `/ingest`, `/ai`, `/ws` |
+| 8554 | camera VLAN only | MediaMTX RTSP |
+| 8888 | operator LAN | HLS fallback |
+| 8889 | operator LAN | WHEP signaling |
+| 8189 tcp/udp | operator LAN | WebRTC ICE |
 
-> PostgreSQL (5432) is on the external DB server (103.146.220.225), not this
-> host — ensure that server's firewall allows inbound connections from this
-> VM's IP, but does **not** expose 5432 to the public internet.
+Do **not** publish 9997, 6379, 8001–8006, 3000, or 8080 beyond localhost.
 
-Using `ufw`:
+> PostgreSQL lives on your external DB host. Allow that server to accept connections from this VM only — never from the public internet.
+
+Using `ufw` (operator + camera networks only):
 
 ```bash
 sudo ufw allow 80/tcp
-sudo ufw allow 3000/tcp
-sudo ufw allow 8001:8004/tcp
-sudo ufw allow 8006/tcp
-sudo ufw allow 8080/tcp
 sudo ufw allow 8554/tcp
 sudo ufw allow 8888:8889/tcp
 sudo ufw allow 8189/tcp
 sudo ufw allow 8189/udp
-sudo ufw allow 9997/tcp
 ```
 
-> Do **not** expose 5432 (Postgres) or 6379 (Redis) to the public internet —
-> leave them firewalled to localhost/LAN only.
+See [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -209,8 +197,8 @@ exposing this to real traffic, change:
 - The external PostgreSQL credentials in `DATABASE_URL` — make sure that
   user has access only to `dmp_db`, and that the DB server's firewall only
   allows connections from this VM (and any other trusted hosts)
-- `JWT_SECRET` in `alert-service` (currently `dev_jwt_secret_change_in_prod`)
-- `KEYCLOAK_ADMIN_PASSWORD` (currently `admin`)
+- `JWT_SECRET` in `.env` (alert-service)
+- `KEYCLOAK_ADMIN_PASSWORD` in `.env`
 - MediaMTX `authMethod: internal` / `authInternalUsers` in
   `services/video-ingest/mediamtx.yml` currently allows **any** client to
   publish/read streams — restrict this for production
